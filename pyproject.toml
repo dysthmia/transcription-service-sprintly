@@ -1,0 +1,25 @@
+[project]
+name = "transcription-service-sprintly"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "aioboto3>=15.5.0",
+    "aiokafka>=0.14.0",
+    "alembic>=1.20.1",
+    "asyncpg>=0.32.0",
+    "httpx>=0.28.1",
+    "pydantic>=2.14.1",
+    "pydantic-settings>=2.16.1",
+    "pymupdf>=2.0",
+    "python-docx>=1.2.0",
+    "python-magic>=0.4.27",
+    "sqlalchemy[asyncio]>=2.1.6",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.17.2",
+]
