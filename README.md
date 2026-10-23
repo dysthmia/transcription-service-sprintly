@@ -425,6 +425,3 @@ API_REQUEST_TIMEOUT_SECONDS=120
 - [YouTube API Developer Policies](https://developers.google.com/youtube/terms/developer-policies) — ограничения скачивания/выделения аудио.
 
 ---
-
-*Документ описывает согласованную архитектуру MVP, а не уже работающую реализацию. Не согласованные с другими командами изменения помечены отдельно.*
-
