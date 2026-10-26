@@ -9,17 +9,20 @@ from app.core.exceptions import ContentError
 from app.features.extraction.base import DetectedType, ExtractionResult
 from app.features.extraction.detector import detect_type
 from app.features.extraction.extractors.docx import DocxExtractor
+from app.features.extraction.extractors.image import ImageExtractor, VisionClient
 from app.features.extraction.extractors.pdf import PdfExtractor
 from app.features.extraction.extractors.txt import TxtExtractor
+from app.infrastructure.ai.deepseek import DeepSeekClient
 
 
 class ExtractionService:
     """Выбирает готовый extractor для текстовых документов."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, vision_client: VisionClient | None = None) -> None:
         self._settings = settings
+        self._vision_client = vision_client or DeepSeekClient(settings)
 
-    def extract(self, source: Path) -> ExtractionResult:
+    async def extract(self, source: Path) -> ExtractionResult:
         """Проверяет размер, определяет тип и запускает подходящий extractor."""
         self._check_file_size(source)
         detected_type = detect_type(source)
@@ -29,7 +32,9 @@ class ExtractionService:
         if detected_type is DetectedType.DOCX:
             return DocxExtractor().extract(source)
         if detected_type is DetectedType.PDF:
-            return PdfExtractor(self._settings.max_pdf_pages).extract(source)
+            return await PdfExtractor(self._settings.max_pdf_pages, self._vision_client).extract(source)
+        if detected_type in {DetectedType.PNG, DetectedType.JPEG}:
+            return await ImageExtractor(self._vision_client, detected_type).extract(source)
 
         raise ContentError(
             "unsupported_format",
