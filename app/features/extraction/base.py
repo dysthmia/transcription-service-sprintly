@@ -18,6 +18,7 @@ class DetectedType(StrEnum):
     PNG = "png"
     MP3 = "mp3"
     MP4 = "mp4"
+    YOUTUBE = "youtube"
 
 
 @dataclass(frozen=True, slots=True)

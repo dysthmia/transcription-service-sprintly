@@ -13,6 +13,7 @@ from app.features.extraction.extractors.image import ImageExtractor, VisionClien
 from app.features.extraction.extractors.media import MediaExtractor, SpeechToTextClient
 from app.features.extraction.extractors.pdf import PdfExtractor
 from app.features.extraction.extractors.txt import TxtExtractor
+from app.features.extraction.extractors.youtube import YoutubeExtractor
 from app.infrastructure.ai.deepseek import DeepSeekClient
 
 
@@ -43,22 +44,32 @@ class ExtractionService:
         if detected_type in {DetectedType.PNG, DetectedType.JPEG}:
             return await ImageExtractor(self._vision_client, detected_type).extract(source)
         if detected_type in {DetectedType.MP3, DetectedType.MP4}:
-            stt_client = self._stt_client
-            if stt_client is None:
-                from app.infrastructure.ai.groq import GroqClient
-
-                stt_client = GroqClient(self._settings)
-            return await MediaExtractor(
-                stt_client,
-                detected_type,
-                self._settings.max_media_file_size_mb,
-                self._settings.max_media_duration_seconds,
-                self._settings.stt_chunk_seconds,
-            ).extract(source)
+            return await self._media_extractor(detected_type).extract(source)
 
         raise ContentError(
             "unsupported_format",
             "Извлечение для этого типа материала пока недоступно.",
+        )
+
+    async def extract_youtube(self, source_url: str) -> ExtractionResult:
+        """Скачивает разрешённую аудиодорожку YouTube и передаёт её в общий STT pipeline."""
+        return await YoutubeExtractor(
+            self._media_extractor(DetectedType.YOUTUBE)
+        ).extract(source_url)
+
+    def _media_extractor(self, detected_type: DetectedType) -> MediaExtractor:
+        stt_client = self._stt_client
+        if stt_client is None:
+            from app.infrastructure.ai.groq import GroqClient
+
+            stt_client = GroqClient(self._settings)
+
+        return MediaExtractor(
+            stt_client,
+            detected_type,
+            self._settings.max_media_file_size_mb,
+            self._settings.max_media_duration_seconds,
+            self._settings.stt_chunk_seconds,
         )
 
     def _check_file_size(self, source: Path) -> None:
