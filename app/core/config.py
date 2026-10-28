@@ -58,6 +58,7 @@ class Settings(BaseSettings):
     max_pdf_pages: int = 500
     max_media_duration_seconds: int = 3600
     max_media_file_size_mb: int = 200
+    stt_chunk_seconds: int = 600
     api_request_timeout_seconds: int = 120
 
 
