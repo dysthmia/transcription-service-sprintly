@@ -117,6 +117,23 @@ class JobsRepository:
         )
         return result.rowcount == 1
 
+    async def update_stage_and_extend_lease(
+        self, job_id: str, stage: JobStage, lease_for: timedelta
+    ) -> bool:
+        """Фиксирует этап и продлевает аренду job перед долгой операцией."""
+        result = await self._session.execute(
+            update(TranscriptionJob)
+            .where(
+                TranscriptionJob.job_id == job_id,
+                TranscriptionJob.status == JobStatus.PROCESSING.value,
+            )
+            .values(
+                current_stage=stage.value,
+                locked_until=datetime.now(UTC) + lease_for,
+            )
+        )
+        return result.rowcount == 1
+
     async def move_to_retry_wait(
         self,
         job_id: str,
