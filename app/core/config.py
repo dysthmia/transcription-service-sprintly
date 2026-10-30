@@ -18,6 +18,8 @@ class Settings(BaseSettings):
     app_env: str = "development"
     log_level: str = "INFO"
     worker_concurrency: int = 3
+    worker_poll_interval_seconds: float = 1.0
+    shutdown_grace_seconds: float = 30.0
     job_target_seconds: int = 180
     job_max_attempts: int = 3
     job_lease_seconds: int = 300

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +12,13 @@ import pymupdf
 from app.core.exceptions import ContentError
 from app.features.extraction.base import DetectedType, ExtractionResult
 from app.features.extraction.extractors.image import VisionClient
+
+
+@dataclass(frozen=True, slots=True)
+class _PdfPage:
+    text: str
+    tables: list[str]
+    vision_image: bytes | None
 
 
 class PdfExtractor:
@@ -24,28 +33,21 @@ class PdfExtractor:
     async def extract(self, source: Path) -> ExtractionResult:
         """Извлекает text layer и применяет vision лишь к почти пустым страницам."""
         try:
-            document = pymupdf.open(source)
+            page_count, pages, table_count = await asyncio.to_thread(self._read_pages, source)
+        except ContentError:
+            raise
         except Exception as error:
             raise ContentError("corrupted_file", "Не удалось прочитать PDF-файл.") from error
 
-        with document:
-            page_count = document.page_count
-            if page_count > self._max_pages:
-                raise ContentError("file_too_large", "Превышено допустимое число страниц PDF.")
-
-            page_contents: list[str] = []
-            vision_page_count = 0
-            table_count = 0
-            for page in document:
-                page_text = page.get_text("text", sort=True).strip()
-                tables = self._extract_tables(page)
-                table_count += len(tables)
-                page_content = "\n\n".join(part for part in [page_text, *tables] if part)
-                if len(page_text) < 20 and not tables:
-                    page_content = await self._extract_page_with_vision(page)
-                    vision_page_count += 1
-                if page_content:
-                    page_contents.append(page_content)
+        page_contents: list[str] = []
+        vision_page_count = 0
+        for page in pages:
+            page_content = "\n\n".join(part for part in [page.text, *page.tables] if part)
+            if page.vision_image is not None:
+                page_content = await self._extract_page_with_vision(page.vision_image)
+                vision_page_count += 1
+            if page_content:
+                page_contents.append(page_content)
 
         content = "\n\n".join(page_contents)
         return ExtractionResult(
@@ -59,10 +61,31 @@ class PdfExtractor:
             },
         )
 
-    async def _extract_page_with_vision(self, page: pymupdf.Page) -> str:
-        """Рендерит одну страницу в PNG-байты без создания временного файла."""
-        image = page.get_pixmap(matrix=pymupdf.Matrix(2, 2), alpha=False).tobytes("png")
+    async def _extract_page_with_vision(self, image: bytes) -> str:
+        """Передаёт заранее отрендеренную страницу в Vision без временного файла."""
         return await self._vision_client.extract_vision_markdown(image, "image/png")
+
+    def _read_pages(self, source: Path) -> tuple[int, list[_PdfPage], int]:
+        """Выполняет блокирующее чтение PDF в worker thread."""
+        with pymupdf.open(source) as document:
+            page_count = document.page_count
+            if page_count > self._max_pages:
+                raise ContentError("file_too_large", "Превышено допустимое число страниц PDF.")
+
+            pages: list[_PdfPage] = []
+            table_count = 0
+            for page in document:
+                page_text = page.get_text("text", sort=True).strip()
+                tables = self._extract_tables(page)
+                table_count += len(tables)
+                vision_image = self._render_page(page) if len(page_text) < 20 and not tables else None
+                pages.append(_PdfPage(page_text, tables, vision_image))
+
+        return page_count, pages, table_count
+
+    @staticmethod
+    def _render_page(page: pymupdf.Page) -> bytes:
+        return page.get_pixmap(matrix=pymupdf.Matrix(2, 2), alpha=False).tobytes("png")
 
     @staticmethod
     def _extract_tables(page: pymupdf.Page) -> list[str]:

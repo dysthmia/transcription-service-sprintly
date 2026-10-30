@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pymupdf
 import pytest
@@ -93,6 +95,32 @@ async def test_extracts_pdf_text_layer(service: ExtractionService, tmp_path: Pat
     assert "PDF text layer example" in result.content
     assert result.detected_type is DetectedType.PDF
     assert not result.metadata["needs_vision_fallback"]
+
+
+@pytest.mark.asyncio
+async def test_pdf_local_reading_runs_in_worker_thread(
+    service: ExtractionService,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.pdf"
+    document = pymupdf.open()
+    document.new_page().insert_text((72, 72), "PDF content")
+    document.save(source)
+    document.close()
+    calls: list[object] = []
+
+    async def run_in_current_thread(
+        function: Callable[..., Any], *args: Any
+    ) -> Any:
+        calls.append(function)
+        return function(*args)
+
+    monkeypatch.setattr("app.features.extraction.extractors.pdf.asyncio.to_thread", run_in_current_thread)
+
+    await service.extract(source)
+
+    assert calls
 
 
 @pytest.mark.asyncio
