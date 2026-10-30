@@ -241,6 +241,21 @@ class JobsRepository:
         )
         return result.rowcount == 1
 
+    async def schedule_outbox_retry(self, event_id: str, *, retry_at: datetime) -> bool:
+        """Откладывает повторную публикацию, сохраняя pending-статус события."""
+        result = await self._session.execute(
+            update(OutboxEvent)
+            .where(
+                OutboxEvent.id == event_id,
+                OutboxEvent.status == OutboxStatus.PENDING.value,
+            )
+            .values(
+                attempt_count=OutboxEvent.attempt_count + 1,
+                next_retry_at=retry_at,
+            )
+        )
+        return result.rowcount == 1
+
     async def _get_processing_job(self, job_id: str) -> TranscriptionJob:
         statement = (
             select(TranscriptionJob)

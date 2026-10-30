@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     job_target_seconds: int = 180
     job_max_attempts: int = 3
     job_lease_seconds: int = 300
+    outbox_poll_interval_seconds: float = 1.0
     pipeline_version: str = "v1"
     summary_chunk_size: int = 12_000
 
