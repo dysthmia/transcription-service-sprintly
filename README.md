@@ -381,6 +381,34 @@ API_REQUEST_TIMEOUT_SECONDS=120
 
 **Integration tests:** PostgreSQL + Alembic на чистой БД; уникальность `job_id` и `event_id`; consumer commit после транзакции; `SKIP LOCKED` при нескольких worker; lease recovery; outbox повторной публикации с тем же ID; S3 get/put через подменяемый тестовый endpoint; mock DeepSeek/Groq (реальные платные запросы не обязательны для CI).
 
+### Запуск тестов
+
+Unit-тесты не требуют внешних сервисов:
+
+```bash
+make test-unit
+```
+
+Для integration suite создайте отдельную PostgreSQL database, укажите её asyncpg DSN в
+`TEST_DATABASE_URL` и убедитесь, что это **не** runtime database `transcript`. Перед
+тестами Alembic откатывает и заново применяет миграции только к указанной тестовой БД;
+после набора миграции откатываются до `base`.
+
+```bash
+TEST_DATABASE_URL=postgresql+asyncpg://USER:PASSWORD@HOST:PORT/transcript_test \\
+  make test-integration
+```
+
+При отсутствии `TEST_DATABASE_URL` integration-тесты пропускаются, а `make test-all`
+по-прежнему запускает unit-тесты.
+
+Для проверки Alembic на отдельной чистой БД локального Compose PostgreSQL можно
+переопределить только имя БД, не меняя рабочий `.env`:
+
+```bash
+make MIGRATE_POSTGRES_DB=transcript_test migrate
+```
+
 **Smoke / ручные тесты:** русские и английские TXT/DOCX/PDF; скан с формулой и таблицей; PNG/JPEG; MP3 и MP4 с русской речью; один доступный и один недоступный YouTube URL; длительное медиа; повторный Kafka event; повторный `job_id`; новый `job_id` того же материала; рестарт в середине обработки.
 
 **Готово к интеграции, когда:**

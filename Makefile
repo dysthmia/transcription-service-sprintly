@@ -3,19 +3,23 @@ export
 
 export PROJECT_ROOT := $(CURDIR)
 
-.PHONY: help postgres-up postgres-down postgres-logs postgres-cleanup migrate app-build app-up app-down app-logs ps
+.PHONY: help postgres-up postgres-down postgres-logs postgres-cleanup migrate app-build app-up app-down app-logs ps test-unit test-integration test-all
 
 help:
 	@echo 'make postgres-up       - start PostgreSQL'
 	@echo 'make postgres-down     - stop PostgreSQL'
 	@echo 'make postgres-logs     - PostgreSQL logs'
 	@echo 'make postgres-cleanup  - delete local PostgreSQL data (confirmation required)'
-	@echo 'make migrate           - apply Alembic migrations (once code exists)'
+	@echo 'make migrate           - apply Alembic migrations'
+	@echo 'make MIGRATE_POSTGRES_DB=transcript_test migrate - migrate a separate local database'
 	@echo 'make app-build         - build Transcript image (once Dockerfile exists)'
 	@echo 'make app-up            - start Transcript (once code exists)'
 	@echo 'make app-down          - stop Transcript'
 	@echo 'make app-logs          - Transcript logs'
 	@echo 'make ps                - show containers'
+	@echo 'make test-unit         - run unit tests'
+	@echo 'make test-integration  - run PostgreSQL integration tests (TEST_DATABASE_URL required)'
+	@echo 'make test-all          - run all tests'
 
 postgres-up:
 	@mkdir -p "$(PROJECT_ROOT)/out/pgdata"
@@ -39,7 +43,7 @@ postgres-cleanup:
 	fi
 
 migrate:
-	@docker compose --profile tools run --rm migrate
+	@docker compose --profile tools run --rm $(if $(MIGRATE_POSTGRES_DB),-e POSTGRES_DB="$(MIGRATE_POSTGRES_DB)") migrate
 
 app-build:
 	@docker compose --profile runtime build transcript
@@ -55,3 +59,12 @@ app-logs:
 
 ps:
 	@docker compose ps -a
+
+test-unit:
+	@uv run --frozen pytest tests/unit
+
+test-integration:
+	@uv run --frozen pytest -m integration
+
+test-all:
+	@uv run --frozen pytest
