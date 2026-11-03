@@ -345,10 +345,11 @@ S3_SECRET_ACCESS_KEY=
 S3_OUTPUT_BUCKET=
 S3_ADDRESSING_STYLE=auto
 
-# AI APIs
+# AI APIs: RelayModels is OpenAI-compatible and is used for summaries and vision.
+# Put the RelayModels key into the legacy DEEPSEEK_API_KEY variable.
 DEEPSEEK_API_KEY=
-DEEPSEEK_BASE_URL=https://api.deepseek.com
-DEEPSEEK_MODEL=deepseek-flash
+DEEPSEEK_BASE_URL=https://api.relaymodels.com/v1
+DEEPSEEK_MODEL=gemini-3.7-flash
 GROQ_API_KEY=
 GROQ_BASE_URL=https://api.groq.com/openai/v1
 STT_MODEL=whisper-large-v3-turbo
@@ -365,13 +366,114 @@ API_REQUEST_TIMEOUT_SECONDS=120
 
 Переменные `POSTGRES_*` — для контейнера DB; приложение получает собранный DSN через config без хардкода. Старт приложения прекращается с понятной ошибкой, если отсутствуют обязательные переменные окружения.
 
-## 11. Docker Compose и развёртывание (план, без кода)
+## 11. Локальный Docker Compose контур
 
-1. `postgres`: отдельная PostgreSQL-БД сервиса Transcript, volume для сохранности данных, healthcheck, сеть Compose, без публичного порта по умолчанию.
-2. `transcript`: Python runtime с FFmpeg, подключение к PostgreSQL, внешним Kafka/S3 и AI API по env, `restart` policy.
-3. Одноразовая команда/сервис `migrate`: `alembic upgrade head`; должна успешно завершиться **перед** рабочим процессом Transcript.
-4. При первом запуске создать `.env` из `.env.example`, внести реальные адреса Kafka/S3 и ключи DeepSeek/Groq, проверить права и TLS.
-5. Обновление: backup PostgreSQL, миграции, запуск приложения, проверка логов и тестового события.
+Для ручного integration-тестирования Compose поднимает PostgreSQL, Kafka в
+KRaft-режиме и MinIO. `init` ждёт healthcheck Kafka и MinIO, затем
+идемпотентно создаёт топики `KAFKA_INPUT_TOPIC`, `KAFKA_OUTPUT_TOPIC`,
+`KAFKA_INPUT_DLQ_TOPIC` и бакеты `S3_SOURCE_BUCKET`, `S3_OUTPUT_BUCKET`.
+`transcript` и `migrate` начинают работу только после успешного завершения
+этого bootstrap-сервиса.
+
+Первый запуск:
+
+```bash
+cp .env.example .env
+# Вставьте RelayModels key в DEEPSEEK_API_KEY и значение GROQ_API_KEY.
+make run-local-test
+```
+
+Настройки Kafka и S3 для `transcript` передаются только из `.env`. Шаблон уже
+содержит локальные адреса внутри сети Compose: `kafka:9092` и
+`http://minio:9000`. С хоста Kafka доступна на `localhost:29092`, MinIO API —
+на `localhost:9000`, а консоль MinIO — на `http://localhost:9001`. Учётные
+данные MinIO в шаблоне предназначены только для локального контура; не
+используйте их во внешней среде.
+
+Данные PostgreSQL и MinIO сохраняются в `out/`. Для повторного bootstrap не
+нужно ничего очищать: повторный запуск `init` не меняет уже созданные топики
+и бакеты. Kafka запущена одним брокером, поэтому локальный контур не проверяет
+репликацию, TLS/SASL и отказоустойчивость production-кластера.
+
+Для остановки контура без удаления данных используйте `make local-test-down`;
+логи трёх сервисов — `make local-test-logs`. `make local-test-reset` запрашивает
+явное `YES` и удаляет только `out/pgdata` и `out/minio-data`.
+
+### Ручная отправка тестовых материалов
+
+`test-sender` — одноразовый Compose tools-контейнер. Он использует Kafka, MinIO,
+топики и бакеты из `.env`, генерирует уникальные ID, валидирует payload текущей
+`MaterialUploadedEvent`-схемой и печатает команду повторной доставки того же
+события. Справка:
+
+```bash
+make sender-help
+```
+
+Загрузить и отправить S3-материал (подходит для TXT, PDF, MP3 и MP4; также
+используйте для DOCX, PNG или JPEG):
+
+```bash
+make sender-send-s3 FILE=./fixtures/material.txt
+make sender-send-s3 FILE=./fixtures/material.pdf
+make sender-send-s3 FILE=./fixtures/material.mp3
+make sender-send-s3 FILE=./fixtures/material.mp4
+```
+
+Или сначала загрузите объект, затем опубликуйте его отдельно:
+
+```bash
+make sender-upload FILE=./fixtures/material.txt
+make sender-publish-s3 SENDER_ARGS="--key manual/material.txt"
+```
+
+Отправить YouTube source (URL должен содержать корректный 11-символьный video ID):
+
+```bash
+make sender-publish-youtube SENDER_ARGS="--url https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+```
+
+Для проверки идемпотентности скопируйте напечатанную sender-команду `Replay the
+same event` или явно передайте `--event-id`, `--job-id`, `--correlation-id`,
+`--material-id`, `--user-id`. Файлы, загруженные sender, находятся в MinIO
+Console в bucket `learning-materials` по выведенному key; успешный результат —
+в bucket `transcript-output` по key из `summary_generated`.
+
+### Наблюдение Kafka-результатов
+
+`test-watch` читает одновременно `KAFKA_OUTPUT_TOPIC` и `KAFKA_INPUT_DLQ_TOPIC`,
+печатает форматированный JSON только для `summary_generated`,
+`transcription_failed` и `invalid_material_uploaded`. Для каждого запуска
+создаётся отдельная group `transcript-manual-watch-<uuid>` с
+`enable_auto_commit=false`: watcher не коммитит offsets рабочих consumer groups.
+
+```bash
+make watch-help
+make watch-results WATCH_ARGS="--job-id <job_id> --once --timeout-seconds 300"
+# Для invalid_material_uploaded не передавайте --job-id: DLQ не содержит его.
+make watch-results WATCH_ARGS="--once --timeout-seconds 60"
+```
+
+### Checklist ручной integration-проверки
+
+Перед каждым сценарием запустите `make run-local-test`; в отдельном терминале
+запустите watcher с `--once` и нужным `job_id` (либо без него для DLQ). Значения
+`<job_id>` берите из вывода sender. Для `summary_generated` откройте MinIO
+Console → `transcript-output` → `summary.key`; для `transcription_failed` и DLQ
+`summary.md` не создаётся.
+
+| Сценарий | Команда | Ожидаемый Kafka event | Проверка MinIO |
+|---|---|---|---|
+| Успешный TXT | `make sender-send-s3 FILE=./fixtures/material.txt` | `summary_generated` | `transcript-output`, key из `summary` |
+| Успешный PDF/DOCX | `make sender-send-s3 FILE=./fixtures/material.pdf` (или `.docx`) | `summary_generated` | `transcript-output`, key из `summary` |
+| Успешный PNG/JPEG | `make sender-send-s3 FILE=./fixtures/material.png` (или `.jpg`) | `summary_generated` | `transcript-output`, key из `summary` |
+| Успешный MP3/MP4 | `make sender-send-s3 FILE=./fixtures/material.mp3` (или `.mp4`) | `summary_generated` | `transcript-output`, key из `summary` |
+| YouTube URL | `make sender-publish-youtube SENDER_ARGS="--url https://www.youtube.com/watch?v=dQw4w9WgXcQ"` | `summary_generated` либо `transcription_failed` для недоступного ролика | Только при успехе: `transcript-output`, key из `summary` |
+| Отсутствующий S3 object | `make sender-publish-s3 SENDER_ARGS="--key manual/missing.txt"` | `transcription_failed` | `summary.md` отсутствует |
+| Невалидный Kafka payload | `docker compose exec kafka /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server localhost:9092 --topic material.events` и введите `{}` | `invalid_material_uploaded` в `material.events.dlq` | Не применяется |
+| Повторная доставка event | Выполните напечатанную sender `Replay the same event` команду | Второй job не создаётся; нового terminal event не ожидается | Один `summary.md` от первой доставки |
+| Новый job для того же material | Повторите sender-команду с новым `--job-id`, тем же `--material-id` | Новый `summary_generated` или `transcription_failed` | При успехе новый key `.../jobs/<new_job_id>/summary.md` |
+| Временно недоступный внешний API | Выполните mock-проверку: `uv run --frozen pytest tests/unit/infrastructure/test_deepseek_client.py tests/unit/infrastructure/test_groq_client.py` | В runtime после исчерпания retry ожидался бы `transcription_failed`; mock не публикует Kafka event | `summary.md` не создаётся в mock-проверке |
 
 **Не нужен HTTP server.** Наблюдаемость — структурированные логи по `job_id`/`correlation_id`, счётчики стадий и ошибок, SQL-запросы для текущих заданий; не создаём отдельный monitoring stack для MVP.
 

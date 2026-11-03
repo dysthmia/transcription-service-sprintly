@@ -2,12 +2,13 @@
 .gitignore
 .env
 .env.*
+!.env.example
 .venv
 out
-__pycache__
-*.py[cod]
 .pytest_cache
 .ruff_cache
+__pycache__
+*.py[cod]
 .coverage
 htmlcov
 tests

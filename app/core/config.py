@@ -52,8 +52,8 @@ class Settings(BaseSettings):
     s3_addressing_style: str = "auto"
 
     deepseek_api_key: SecretStr
-    deepseek_base_url: str = "https://api.deepseek.com"
-    deepseek_model: str = "deepseek-flash"
+    deepseek_base_url: str = "https://api.relaymodels.com/v1"
+    deepseek_model: str = "gemini-3.7-flash"
 
     groq_api_key: SecretStr
     groq_base_url: str = "https://api.groq.com/openai/v1"

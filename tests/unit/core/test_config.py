@@ -65,3 +65,10 @@ def test_settings_redact_secrets(settings_environment: None) -> None:
     assert "deepseek-secret" not in rendered
     assert "secret-access-key" not in rendered
     assert "**********" in rendered
+
+
+def test_relaymodels_defaults_are_used_for_text_and_vision(settings_environment: None) -> None:
+    settings = Settings(_env_file=None)
+
+    assert settings.deepseek_base_url == "https://api.relaymodels.com/v1"
+    assert settings.deepseek_model == "gemini-3.7-flash"
