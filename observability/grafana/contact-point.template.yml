@@ -1,0 +1,12 @@
+# This file is intentionally outside provisioning. Copy it to an untracked
+# provisioning file only after supplying a real secret from the deployment system.
+apiVersion: 1
+contactPoints:
+  - orgId: 1
+    name: production-webhook
+    receivers:
+      - uid: transcription-production-webhook
+        type: webhook
+        disableResolveMessage: false
+        settings:
+          url: $ALERT_WEBHOOK_URL

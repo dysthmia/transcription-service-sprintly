@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -17,6 +18,9 @@ class Settings(BaseSettings):
 
     app_env: str = "development"
     log_level: str = "INFO"
+    log_format: Literal["json", "console"] | None = None
+    service_name: str = "transcription-service"
+    service_version: str = "unknown"
     worker_concurrency: int = 3
     worker_poll_interval_seconds: float = 1.0
     shutdown_grace_seconds: float = 30.0

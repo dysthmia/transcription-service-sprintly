@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 from contextlib import asynccontextmanager
 from datetime import timedelta
@@ -8,8 +9,10 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import structlog
 
 from app.core.exceptions import ContentError, TransientExternalError
+from app.core.logging import configure_logging
 from app.features.extraction.base import DetectedType, ExtractionResult
 from app.workers.processor import JobProcessor
 
@@ -260,3 +263,79 @@ async def test_returns_false_when_no_job_is_available(tmp_path: Path) -> None:
 
     assert not await processor.process_next_job()
     assert not temporary_directory.cleaned
+
+
+def _log_records(capsys: pytest.CaptureFixture[str]) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+
+
+@pytest.mark.asyncio
+async def test_logs_successful_lifecycle_stages_and_clears_context(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    configure_logging("INFO", log_format="json")
+    repository = FakeRepository(job())
+    processor = build_processor(
+        repository,
+        FakeExtractionService(ExtractionResult("text", DetectedType.TXT)),
+        FakeSummarizationService("summary"),
+        FakeS3(),
+        TemporaryDirectorySpy(tmp_path / "job-temp"),
+    )
+
+    assert await processor.process_next_job()
+    structlog.get_logger("test").info("after_job")
+
+    records = _log_records(capsys)
+    assert [record["event"] for record in records[:3]] == [
+        "job.claimed",
+        "job.processing.started",
+        "job.stage.completed",
+    ]
+    completed_stages = [record for record in records if record["event"] == "job.stage.completed"]
+    assert [record["stage"] for record in completed_stages] == [
+        "download",
+        "extract",
+        "clean",
+        "summarize",
+        "upload",
+    ]
+    assert all(isinstance(record["duration_ms"], float) for record in completed_stages)
+    assert [record["event"] for record in records].count("job.completed") == 1
+    assert "job_id" not in records[-1]
+
+
+@pytest.mark.asyncio
+async def test_logs_retry_and_unexpected_error_with_traceback(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    configure_logging("INFO", log_format="json")
+    retry_repository = FakeRepository(job())
+    retry_processor = build_processor(
+        retry_repository,
+        FakeExtractionService(TransientExternalError("temporary", "retry")),
+        FakeSummarizationService("unused"),
+        FakeS3(),
+        TemporaryDirectorySpy(tmp_path / "retry-temp"),
+    )
+    await retry_processor.process_next_job()
+    retry_records = _log_records(capsys)
+    retry = next(record for record in retry_records if record["event"] == "job.retry.scheduled")
+    assert retry["error_code"] == "temporary"
+    assert retry["retryable"] is True
+
+    unexpected_repository = FakeRepository(job())
+    unexpected_processor = build_processor(
+        unexpected_repository,
+        FakeExtractionService(RuntimeError("boom")),
+        FakeSummarizationService("unused"),
+        FakeS3(),
+        TemporaryDirectorySpy(tmp_path / "unexpected-temp"),
+    )
+    await unexpected_processor.process_next_job()
+    unexpected_records = _log_records(capsys)
+    unexpected = next(
+        record for record in unexpected_records if record["event"] == "job.unexpected_error"
+    )
+    assert unexpected["exception"]["type"] == "RuntimeError"
+    assert "RuntimeError" in unexpected["exception"]["traceback"]

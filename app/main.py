@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import signal
 from collections.abc import Awaitable, Callable
 from typing import Any
+
+import structlog
 
 from app.core.config import Settings, get_settings
 from app.core.database import Database
@@ -21,7 +22,7 @@ from app.infrastructure.s3.client import S3Client
 from app.workers.outbox_publisher import OutboxPublisher
 from app.workers.processor import JobProcessor
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 async def worker_loop(
@@ -30,10 +31,14 @@ async def worker_loop(
     poll_interval_seconds: float,
 ) -> None:
     """Последовательно обрабатывает jobs, пока приложение не запросит остановку."""
-    while not stop_event.is_set():
-        processed = await processor.process_next_job()
-        if not processed:
-            await _wait_for_stop_or_timeout(stop_event, poll_interval_seconds)
+    logger.info("component.started", component="job.worker")
+    try:
+        while not stop_event.is_set():
+            processed = await processor.process_next_job()
+            if not processed:
+                await _wait_for_stop_or_timeout(stop_event, poll_interval_seconds)
+    finally:
+        logger.info("component.stopped", component="job.worker")
 
 
 async def run_runtime(
@@ -66,6 +71,7 @@ async def run_runtime(
     ]
     background_tasks = [consumer_task, publisher_task, *worker_tasks]
     stop_task = asyncio.create_task(shutdown_requested.wait(), name="shutdown-wait")
+    logger.info("service.started")
 
     try:
         done, _ = await asyncio.wait(
@@ -75,6 +81,7 @@ async def run_runtime(
             _log_finished_background_tasks(done)
             shutdown_requested.set()
     finally:
+        logger.info("service.stopping")
         stop_task.cancel()
         await asyncio.gather(stop_task, return_exceptions=True)
 
@@ -84,12 +91,20 @@ async def run_runtime(
 
         await _finish_workers(worker_tasks, settings.shutdown_grace_seconds)
         await _close_resources(close_callbacks or [])
+        logger.info("service.stopped")
 
 
 async def main() -> None:
     """Собирает зависимости приложения и запускает его до SIGTERM/SIGINT."""
     settings = get_settings()
-    configure_logging(settings.log_level)
+    configure_logging(
+        settings.log_level,
+        log_format=settings.log_format,
+        service_name=settings.service_name,
+        service_version=settings.service_version,
+        app_env=settings.app_env,
+    )
+    logger.info("application_starting")
 
     database = Database(settings)
     deepseek_client = DeepSeekClient(settings)
@@ -129,7 +144,7 @@ def _install_signal_handlers(stop_event: asyncio.Event) -> None:
         try:
             loop.add_signal_handler(signal_number, stop_event.set)
         except (NotImplementedError, RuntimeError):
-            logger.warning("Signal handler is unavailable for %s", signal_number.name)
+            logger.warning("signal_handler_unavailable", signal=signal_number.name)
 
 
 def _log_finished_background_tasks(tasks: set[asyncio.Task[Any]]) -> None:
@@ -138,9 +153,9 @@ def _log_finished_background_tasks(tasks: set[asyncio.Task[Any]]) -> None:
             continue
         error = task.exception()
         if error is None:
-            logger.warning("Background task finished unexpectedly: %s", task.get_name())
+            logger.warning("background_task_finished_unexpectedly", task=task.get_name())
         else:
-            logger.error("Background task failed: %s", task.get_name(), exc_info=error)
+            logger.error("background_task.failed", task=task.get_name(), exc_info=error)
 
 
 async def _finish_workers(
@@ -148,7 +163,7 @@ async def _finish_workers(
 ) -> None:
     _, pending = await asyncio.wait(worker_tasks, timeout=shutdown_grace_seconds)
     if pending:
-        logger.warning("Cancelling %d worker(s) after shutdown grace period", len(pending))
+        logger.warning("workers_cancelled_after_grace_period", worker_count=len(pending))
         for task in pending:
             task.cancel()
     await asyncio.gather(*worker_tasks, return_exceptions=True)
@@ -158,8 +173,8 @@ async def _close_resources(close_callbacks: list[Callable[[], Awaitable[None]]])
     for close in close_callbacks:
         try:
             await close()
-        except Exception:
-            logger.exception("Failed to close application resource")
+        except Exception as error:
+            logger.error("resource.close.failed", exc_info=error)
 
 
 if __name__ == "__main__":

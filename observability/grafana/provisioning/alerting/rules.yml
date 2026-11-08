@@ -1,0 +1,185 @@
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: transcription-service-critical
+    folder: Observability
+    interval: 1m
+    rules:
+      - uid: transcription-background-task-failed
+        title: Transcription background task failed
+        condition: B
+        for: 5m
+        noDataState: NoData
+        execErrState: Alerting
+        labels: {severity: critical, service: transcription-service}
+        annotations:
+          summary: A background runtime task has failed repeatedly.
+          description: Inspect the structured exception and restart only the affected component after identifying the cause.
+          runbook_url: https://github.com/REPLACE_WITH_YOUR_ORG/transcription-service-sprintly/blob/main/observability/RUNBOOK.md#background-task-failed
+        data:
+          - refId: A
+            datasourceUid: loki
+            relativeTimeRange: {from: 600, to: 0}
+            model: {expr: 'sum(count_over_time({service="transcription-service"} | json | event="background_task.failed" [10m]))', refId: A}
+          - refId: B
+            datasourceUid: __expr__
+            relativeTimeRange: {from: 0, to: 0}
+            model:
+              refId: B
+              type: classic_conditions
+              datasource: {type: __expr__, uid: __expr__}
+              conditions: [{type: query, evaluator: {type: gt, params: [0]}, operator: {type: and}, query: {params: [A]}, reducer: {type: last, params: []}}]
+      - uid: transcription-job-failure-spike
+        title: Transcription job failure spike
+        condition: B
+        for: 10m
+        noDataState: OK
+        execErrState: Alerting
+        labels: {severity: critical, service: transcription-service}
+        annotations:
+          summary: Five or more terminal job failures occurred in ten minutes.
+          description: Review error_code and stage breakdown before disabling intake or retrying jobs.
+          runbook_url: https://github.com/REPLACE_WITH_YOUR_ORG/transcription-service-sprintly/blob/main/observability/RUNBOOK.md#job-failure-spike
+        data:
+          - refId: A
+            datasourceUid: loki
+            relativeTimeRange: {from: 600, to: 0}
+            model: {expr: 'sum(count_over_time({service="transcription-service"} | json | event="job.failed" [10m]))', refId: A}
+          - refId: B
+            datasourceUid: __expr__
+            relativeTimeRange: {from: 0, to: 0}
+            model:
+              refId: B
+              type: classic_conditions
+              datasource: {type: __expr__, uid: __expr__}
+              conditions: [{type: query, evaluator: {type: gt, params: [4]}, operator: {type: and}, query: {params: [A]}, reducer: {type: last, params: []}}]
+      - uid: transcription-loki-query-error
+        title: Loki datasource query error
+        condition: B
+        for: 5m
+        noDataState: NoData
+        execErrState: Alerting
+        labels: {severity: critical, service: transcription-service}
+        annotations:
+          summary: Grafana cannot execute the Loki health query.
+          description: This is an execution-error alert; NoData remains visible rather than being reported as healthy.
+          runbook_url: https://github.com/REPLACE_WITH_YOUR_ORG/transcription-service-sprintly/blob/main/observability/RUNBOOK.md#loki-query-error
+        data:
+          - refId: A
+            datasourceUid: loki
+            relativeTimeRange: {from: 300, to: 0}
+            model: {expr: 'sum(count_over_time({service=~".+"}[5m]))', refId: A}
+          - refId: B
+            datasourceUid: __expr__
+            relativeTimeRange: {from: 0, to: 0}
+            model:
+              refId: B
+              type: classic_conditions
+              datasource: {type: __expr__, uid: __expr__}
+              conditions: [{type: query, evaluator: {type: gt, params: [1000000000]}, operator: {type: and}, query: {params: [A]}, reducer: {type: last, params: []}}]
+  - orgId: 1
+    name: transcription-service-warning
+    folder: Observability
+    interval: 1m
+    rules:
+      - uid: transcription-job-retries-high
+        title: Transcription job retries high
+        condition: B
+        for: 10m
+        noDataState: OK
+        execErrState: Alerting
+        labels: {severity: warning, service: transcription-service}
+        annotations:
+          summary: More than ten job retries were scheduled in fifteen minutes.
+          description: Check error_code, provider latency and external dependency failures.
+          runbook_url: https://github.com/REPLACE_WITH_YOUR_ORG/transcription-service-sprintly/blob/main/observability/RUNBOOK.md#job-retries
+        data:
+          - refId: A
+            datasourceUid: loki
+            relativeTimeRange: {from: 900, to: 0}
+            model: {expr: 'sum(count_over_time({service="transcription-service"} | json | event="job.retry.scheduled" [15m]))', refId: A}
+          - refId: B
+            datasourceUid: __expr__
+            relativeTimeRange: {from: 0, to: 0}
+            model: {refId: B, type: classic_conditions, datasource: {type: __expr__, uid: __expr__}, conditions: [{type: query, evaluator: {type: gt, params: [10]}, operator: {type: and}, query: {params: [A]}, reducer: {type: last, params: []}}]}
+      - uid: transcription-dlq-messages
+        title: Transcription input DLQ messages
+        condition: B
+        for: 5m
+        noDataState: OK
+        execErrState: Alerting
+        labels: {severity: warning, service: transcription-service}
+        annotations:
+          summary: Invalid Kafka intake messages were routed to the DLQ.
+          description: Validate producer schema and inspect only DLQ technical metadata, never the original payload in logs.
+          runbook_url: https://github.com/REPLACE_WITH_YOUR_ORG/transcription-service-sprintly/blob/main/observability/RUNBOOK.md#dlq
+        data:
+          - refId: A
+            datasourceUid: loki
+            relativeTimeRange: {from: 600, to: 0}
+            model: {expr: 'sum(count_over_time({service="transcription-service"} | json | event="kafka.message.sent_to_dlq" [10m]))', refId: A}
+          - refId: B
+            datasourceUid: __expr__
+            relativeTimeRange: {from: 0, to: 0}
+            model: {refId: B, type: classic_conditions, datasource: {type: __expr__, uid: __expr__}, conditions: [{type: query, evaluator: {type: gt, params: [0]}, operator: {type: and}, query: {params: [A]}, reducer: {type: last, params: []}}]}
+      - uid: transcription-external-errors-high
+        title: Transcription external dependency errors high
+        condition: B
+        for: 10m
+        noDataState: OK
+        execErrState: Alerting
+        labels: {severity: warning, service: transcription-service}
+        annotations:
+          summary: More than five external dependency failures occurred in ten minutes.
+          description: Filter external_request.failed by provider and error_code to identify the failing dependency.
+          runbook_url: https://github.com/REPLACE_WITH_YOUR_ORG/transcription-service-sprintly/blob/main/observability/RUNBOOK.md#external-dependency-errors
+        data:
+          - refId: A
+            datasourceUid: loki
+            relativeTimeRange: {from: 600, to: 0}
+            model: {expr: 'sum(count_over_time({service="transcription-service"} | json | event="external_request.failed" [10m]))', refId: A}
+          - refId: B
+            datasourceUid: __expr__
+            relativeTimeRange: {from: 0, to: 0}
+            model: {refId: B, type: classic_conditions, datasource: {type: __expr__, uid: __expr__}, conditions: [{type: query, evaluator: {type: gt, params: [5]}, operator: {type: and}, query: {params: [A]}, reducer: {type: last, params: []}}]}
+      - uid: transcription-job-duration-high
+        title: Transcription job duration above target
+        condition: B
+        for: 10m
+        noDataState: OK
+        execErrState: Alerting
+        labels: {severity: warning, service: transcription-service}
+        annotations:
+          summary: A completed job exceeded the configured 180 second target.
+          description: Inspect job.stage.completed p95 by stage; the target is a soft processing objective, not an SLA.
+          runbook_url: https://github.com/REPLACE_WITH_YOUR_ORG/transcription-service-sprintly/blob/main/observability/RUNBOOK.md#job-duration
+        data:
+          - refId: A
+            datasourceUid: loki
+            relativeTimeRange: {from: 900, to: 0}
+            model: {expr: 'max_over_time({service="transcription-service"} | json | event="job.completed" | unwrap duration_ms [15m])', refId: A}
+          - refId: B
+            datasourceUid: __expr__
+            relativeTimeRange: {from: 0, to: 0}
+            model: {refId: B, type: classic_conditions, datasource: {type: __expr__, uid: __expr__}, conditions: [{type: query, evaluator: {type: gt, params: [180000]}, operator: {type: and}, query: {params: [A]}, reducer: {type: last, params: []}}]}
+      - uid: transcription-outbox-retries-high
+        title: Transcription outbox retries high
+        condition: B
+        for: 10m
+        noDataState: OK
+        execErrState: Alerting
+        labels: {severity: warning, service: transcription-service}
+        annotations:
+          summary: More than five outbox publication retries occurred in fifteen minutes.
+          description: Check Kafka availability and external_request.failed entries where provider is kafka.
+          runbook_url: https://github.com/REPLACE_WITH_YOUR_ORG/transcription-service-sprintly/blob/main/observability/RUNBOOK.md#outbox-retries
+        data:
+          - refId: A
+            datasourceUid: loki
+            relativeTimeRange: {from: 900, to: 0}
+            model: {expr: 'sum(count_over_time({service="transcription-service"} | json | event="outbox.retry.scheduled" [15m]))', refId: A}
+          - refId: B
+            datasourceUid: __expr__
+            relativeTimeRange: {from: 0, to: 0}
+            model: {refId: B, type: classic_conditions, datasource: {type: __expr__, uid: __expr__}, conditions: [{type: query, evaluator: {type: gt, params: [5]}, operator: {type: and}, query: {params: [A]}, reducer: {type: last, params: []}}]}

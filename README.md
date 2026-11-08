@@ -144,6 +144,80 @@ transcript-service/
 
 **Принципы:** KISS, YAGNI, умеренные SOLID/ООП. Не создаём слой ради слоя, интерфейс для единственной реализации или отдельные контейнеры на каждый формат. Общий extractor допустим, поскольку поддерживается несколько реализаций. Функции для простого преобразования допустимы наряду с классами.
 
+## Observability: Grafana, Loki, Alloy
+
+Профиль `observability` добавляет Loki (single-binary TSDB на filesystem), Grafana
+и Grafana Alloy. Приложение остаётся единственным источником логов: оно пишет JSON
+Lines в stdout, Docker `local` logging driver является коротким транспортным буфером
+(`20m` × `5`), а Loki — основным 30-дневным хранилищем. Promtail и Docker Loki
+logging plugin не используются.
+
+```bash
+# Local default: DATA_ROOT=./out. Production example:
+export DATA_ROOT=/var/lib/transcription-service
+export GRAFANA_ADMIN_PASSWORD="$(openssl rand -base64 32)"
+
+make observability-config
+make observability-up
+make observability-status
+# Grafana is deliberately only at http://127.0.0.1:3000.
+```
+
+`make app-with-observability-up` starts the worker and observability profiles
+together. `make observability-down` only stops containers: it never removes Loki,
+Alloy, Grafana, or PostgreSQL data. The persistent host paths are:
+
+```text
+${DATA_ROOT}/pgdata
+${DATA_ROOT}/observability/loki
+${DATA_ROOT}/observability/alloy
+${DATA_ROOT}/observability/grafana
+```
+
+Create these paths before first production start and ensure the container users can
+write them. The current Loki image runs as UID `10001`; Grafana commonly runs as
+UID `472`; inspect the pinned images on the target host before ownership changes:
+
+```bash
+sudo install -d -m 0750 /var/lib/transcription-service/observability/{loki,alloy,grafana}
+docker image inspect --format '{{.Config.User}}' grafana/loki:3.7.8 grafana/grafana:13.3.0 grafana/alloy:v1.21.3
+sudo chown -R 10001:10001 /var/lib/transcription-service/observability/loki
+sudo chown -R 472:472 /var/lib/transcription-service/observability/grafana
+```
+
+Alloy receives the Docker socket read-only and has an explicit service allowlist:
+`transcript`, `loki`, `alloy`, `grafana`; PostgreSQL logs are excluded. It only
+promotes `service`, `environment`, `level`, `component`, and `container` to Loki
+labels. Job/correlation/material/user/event IDs remain JSON fields, so query them
+with LogQL JSON parsing rather than labels, for example:
+
+```logql
+{service="transcription-service"} | json | job_id="job-123"
+```
+
+The Grafana admin password is required from the environment (or an uncommitted
+`.env`) and anonymous access is disabled. Expose Grafana externally only through
+an HTTPS reverse proxy; Loki and Alloy have no published host ports.
+
+Grafana provisions the `Observability` folder, the **Transcription Service
+Overview** dashboard, the Loki datasource (stable UID `loki`), and alert rules
+from Git on every clean start. The dashboard filters `job_id` and
+`correlation_id` through LogQL JSON parsing; neither is a Loki label. Alert
+thresholds and operator actions live in
+[`observability/RUNBOOK.md`](observability/RUNBOOK.md). `JOB_TARGET_SECONDS`
+defaults to `180`; when changing it, update the matching duration alert as
+described in the runbook.
+
+No contact-point secret is tracked. For a webhook, Telegram bridge, or email
+integration, copy
+[`observability/grafana/contact-point.template.yml`](observability/grafana/contact-point.template.yml)
+to a protected, untracked provisioning mount, substitute the deployment-managed
+secret, and mount that file into Grafana's `/etc/grafana/provisioning/alerting`.
+Do not place the resulting file in Git.
+
+Production operations, recovery, security checks, LogQL recipes, and incident
+runbooks are maintained in [`docs/observability.md`](docs/observability.md).
+
 **Предварительные зависимости:** Python 3.12+, `uv`, SQLAlchemy 2.x async + `asyncpg`, Alembic, Pydantic v2 + `pydantic-settings`, `aiokafka`, `aioboto3`/`boto3` (выбрать один подход), `httpx`, `PyMuPDF`, `python-docx`, `python-magic`/libmagic, FFmpeg, `pytest` + `pytest-asyncio`. Конкретные версии фиксируем в `uv.lock`. Для PDF-таблиц/формул оцениваем качество на тестовых материалах прежде чем добавлять специализированные библиотеки.
 
 ## 6. PostgreSQL: три таблицы

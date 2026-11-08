@@ -2,8 +2,9 @@ include .env
 export
 
 export PROJECT_ROOT := $(CURDIR)
+export DATA_ROOT ?= $(PROJECT_ROOT)/out
 
-.PHONY: help postgres-up postgres-down postgres-logs postgres-cleanup migrate app-build app-up app-down app-logs ps test-unit test-integration test-all
+.PHONY: help postgres-up postgres-down postgres-logs postgres-cleanup migrate app-build app-up app-down app-logs ps test-unit test-integration test-all observability-up observability-down observability-logs observability-status observability-config app-with-observability-up
 
 help:
 	@echo 'make postgres-up       - start PostgreSQL'
@@ -20,6 +21,12 @@ help:
 	@echo 'make test-unit         - run unit tests'
 	@echo 'make test-integration  - run PostgreSQL integration tests (TEST_DATABASE_URL required)'
 	@echo 'make test-all          - run all tests'
+	@echo 'make observability-up  - start Loki, Alloy, and Grafana'
+	@echo 'make observability-down - stop Loki, Alloy, and Grafana without deleting data'
+	@echo 'make observability-logs - follow observability logs'
+	@echo 'make observability-status - show observability service status'
+	@echo 'make observability-config - render the Compose configuration'
+	@echo 'make app-with-observability-up - start app and observability profile'
 
 postgres-up:
 	@mkdir -p "$(PROJECT_ROOT)/out/pgdata"
@@ -68,3 +75,23 @@ test-integration:
 
 test-all:
 	@uv run --frozen pytest
+
+observability-up:
+	@mkdir -p "$(DATA_ROOT)/observability/loki" "$(DATA_ROOT)/observability/alloy" "$(DATA_ROOT)/observability/grafana"
+	@docker compose --profile observability up -d loki alloy grafana
+
+observability-down:
+	@docker compose --profile observability stop loki alloy grafana
+
+observability-logs:
+	@docker compose --profile observability logs -f loki alloy grafana
+
+observability-status:
+	@docker compose --profile observability ps loki alloy grafana
+
+observability-config:
+	@docker compose --profile observability config
+
+app-with-observability-up:
+	@mkdir -p "$(DATA_ROOT)/observability/loki" "$(DATA_ROOT)/observability/alloy" "$(DATA_ROOT)/observability/grafana"
+	@docker compose --profile runtime --profile observability up -d transcript loki alloy grafana

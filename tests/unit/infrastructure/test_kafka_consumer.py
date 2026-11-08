@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from app.core.logging import configure_logging
 from app.infrastructure.kafka.consumer import MaterialUploadedConsumer
 
 
@@ -185,3 +186,31 @@ async def test_invalid_payload_is_sent_to_dlq_before_offset_commit(
         )
     ]
     assert calls == ["offset_commit"]
+
+
+@pytest.mark.asyncio
+async def test_logs_duplicate_and_dlq_without_payload(
+    settings: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    configure_logging("INFO", log_format="json")
+
+    class DuplicateRepository(FakeRepository):
+        processed_event_is_new = False
+
+    calls: list[str] = []
+    monkeypatch.setattr("app.infrastructure.kafka.consumer.JobsRepository", DuplicateRepository)
+    handler = MaterialUploadedConsumer(
+        settings, FakeDatabase(calls), consumer=FakeConsumer(calls), dlq_producer=FakeProducer()
+    )
+    await handler.handle_message(valid_message())
+    duplicate_output = capsys.readouterr().out
+    assert '"event": "kafka.message.duplicate"' in duplicate_output
+
+    invalid_message = valid_message()
+    invalid_message.value = b'{"secret":"must-not-log"'
+    await handler.handle_message(invalid_message)
+    dlq_output = capsys.readouterr().out
+    assert '"event": "kafka.message.sent_to_dlq"' in dlq_output
+    assert "must-not-log" not in dlq_output

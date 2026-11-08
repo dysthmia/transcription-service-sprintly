@@ -6,9 +6,11 @@ import tempfile
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import aioboto3
+import structlog
 from botocore.config import Config
 from botocore.exceptions import (
     ClientError,
@@ -20,6 +22,8 @@ from botocore.exceptions import (
 
 from app.core.config import Settings
 from app.core.exceptions import ContentError, TransientExternalError
+
+logger = structlog.get_logger(__name__)
 
 
 class S3Client:
@@ -50,6 +54,7 @@ class S3Client:
         destination: Path | None = None,
     ) -> Path:
         """Метод скачивает объект из S3 на диск."""
+        started_at = perf_counter()
         is_temporary = destination is None
         if destination is None:
             # Создаётся временный файл. (delete = false потому что после выхода файл должен остаться)
@@ -73,8 +78,10 @@ class S3Client:
             if is_temporary:
                 # Удаляем, если его уже нет то всё ок
                 destination.unlink(missing_ok=True)
+            self._log_failure("download", started_at, error)
             self._raise_mapped_error(error)
 
+        self._log_success("download", started_at)
         return destination
 
     async def upload_file(
@@ -84,6 +91,7 @@ class S3Client:
         bucket: str | None = None,
     ) -> None:
         """Метод загружает локальный файл в S3."""
+        started_at = perf_counter()
         try:
             async with self._client() as client:
                 await client.upload_file(str(source), bucket or self._settings.s3_output_bucket, key)
@@ -94,7 +102,9 @@ class S3Client:
             EndpointConnectionError,
             ReadTimeoutError,
         ) as error:
+            self._log_failure("upload_file", started_at, error)
             self._raise_mapped_error(error)
+        self._log_success("upload_file", started_at)
 
     async def upload_text(
         self,
@@ -104,6 +114,7 @@ class S3Client:
         content_type: str = "text/markdown; charset=utf-8",
     ) -> None:
         """Загружает текст напрямую в S3, не создавая файл."""
+        started_at = perf_counter()
         try:
             async with self._client() as client:
                 await client.put_object(
@@ -119,16 +130,21 @@ class S3Client:
             EndpointConnectionError,
             ReadTimeoutError,
         ) as error:
+            self._log_failure("upload_text", started_at, error)
             self._raise_mapped_error(error)
+        self._log_success("upload_text", started_at)
 
     async def exists(self, bucket: str, key: str) -> bool:
         """Проверяет существует ли файл в S3 хранилище."""
+        started_at = perf_counter()
         try:
             async with self._client() as client:
                 await client.head_object(Bucket=bucket, Key=key)
         except ClientError as error:
             if self._is_missing_source(error):
+                self._log_success("exists", started_at, outcome="not_found", status_code=404)
                 return False
+            self._log_failure("exists", started_at, error)
             self._raise_mapped_error(error)
         except (
             ConnectionClosedError,
@@ -136,8 +152,54 @@ class S3Client:
             EndpointConnectionError,
             ReadTimeoutError,
         ) as error:
+            self._log_failure("exists", started_at, error)
             self._raise_mapped_error(error)
+        self._log_success("exists", started_at)
         return True
+
+    @staticmethod
+    def _log_success(
+        operation: str,
+        started_at: float,
+        *,
+        outcome: str = "success",
+        status_code: int | None = None,
+    ) -> None:
+        fields: dict[str, Any] = {
+            "provider": "s3",
+            "operation": operation,
+            "duration_ms": round((perf_counter() - started_at) * 1000, 2),
+            "outcome": outcome,
+        }
+        if status_code is not None:
+            fields["status_code"] = status_code
+        logger.info("external_request.completed", **fields)
+
+    @staticmethod
+    def _log_failure(operation: str, started_at: float, error: Exception) -> None:
+        status_code = (
+            error.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            if isinstance(error, ClientError)
+            else None
+        )
+        error_code = (
+            error.response.get("Error", {}).get("Code", "s3_request_failed")
+            if isinstance(error, ClientError)
+            else "s3_temporary_failure"
+        )
+        fields: dict[str, Any] = {
+            "provider": "s3",
+            "operation": operation,
+            "duration_ms": round((perf_counter() - started_at) * 1000, 2),
+            "outcome": "failure",
+            "retryable": not isinstance(error, ClientError)
+            or status_code is not None
+            and status_code >= 500,
+            "error_code": error_code,
+        }
+        if status_code is not None:
+            fields["status_code"] = status_code
+        logger.warning("external_request.failed", **fields)
 
     async def _write_body(self, body: Any, destination: Path) -> None:
         """Вызывается из download_file() и сохраняет скачиваемые данные на диск"""

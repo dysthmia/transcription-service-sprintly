@@ -6,6 +6,7 @@ import pytest
 import yt_dlp
 
 from app.core.exceptions import ContentError, TransientExternalError
+from app.core.logging import configure_logging
 from app.features.extraction.base import DetectedType, ExtractionResult
 from app.features.extraction.extractors.youtube import (
     YoutubeExtractor,
@@ -76,3 +77,16 @@ def test_ytdlp_temporary_network_error_is_retryable() -> None:
 
     assert isinstance(mapped, TransientExternalError)
     assert mapped.error_code == "youtube_temporary_failure"
+
+
+def test_ytdlp_access_error_does_not_log_source_url(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    configure_logging("INFO", log_format="json")
+
+    mapped = YtDlpAudioDownloader._mapped_download_error(
+        yt_dlp.utils.DownloadError("ERROR: https://www.youtube.com/watch?v=private")
+    )
+
+    assert isinstance(mapped, ContentError)
+    assert capsys.readouterr().out == ""

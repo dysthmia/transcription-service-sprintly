@@ -7,6 +7,7 @@ import pytest
 from pydantic import SecretStr
 
 from app.core.exceptions import ContentError, TransientExternalError
+from app.core.logging import configure_logging
 from app.infrastructure.ai.deepseek import DeepSeekClient
 
 
@@ -67,4 +68,27 @@ async def test_invalid_deepseek_response_is_not_retryable() -> None:
     with pytest.raises(ContentError, match="invalid_model_output"):
         await client.complete_text("text")
 
+    await async_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_external_request_log_excludes_url_headers_and_prompt(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    configure_logging("INFO", log_format="json")
+    async_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+        )
+    )
+    client = DeepSeekClient(settings(), async_client)
+
+    assert await client.complete_text("private prompt body") == "ok"
+
+    output = capsys.readouterr().out
+    assert '"event": "external_request.completed"' in output
+    assert '"provider": "deepseek"' in output
+    assert "deepseek.example.test" not in output
+    assert "deepseek-secret" not in output
+    assert "private prompt body" not in output
     await async_client.aclose()

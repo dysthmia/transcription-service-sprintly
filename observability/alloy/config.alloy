@@ -1,0 +1,96 @@
+// The allowlist is intentional: PostgreSQL and arbitrary Compose containers are
+// excluded. The Docker socket is mounted read-only by Compose.
+discovery.docker "local" {
+  host             = "unix:///var/run/docker.sock"
+  refresh_interval = "15s"
+}
+
+discovery.relabel "transcript" {
+  targets = discovery.docker.local.targets
+
+  rule {
+    action        = "keep"
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    regex         = "transcript"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+}
+
+discovery.relabel "observability" {
+  targets = discovery.docker.local.targets
+
+  rule {
+    action        = "keep"
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    regex         = "loki|alloy|grafana"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+}
+
+loki.source.docker "transcript" {
+  host          = "unix:///var/run/docker.sock"
+  targets       = discovery.relabel.transcript.output
+  forward_to    = [loki.process.transcript.receiver]
+  labels        = {}
+  relabel_rules = discovery.relabel.transcript.rules
+}
+
+// A malformed line is kept as-is: stage.json simply leaves extraction empty.
+loki.process "transcript" {
+  forward_to = [loki.write.local.receiver]
+
+  stage.json {
+    expressions = {
+      service     = "",
+      environment = "",
+      level       = "",
+      component   = "",
+    }
+  }
+
+  stage.labels {
+    values = {
+      service     = "",
+      environment = "",
+      level       = "",
+      component   = "",
+    }
+  }
+
+  // Enforce the complete label allowlist after JSON parsing.
+  stage.label_keep {
+    values = ["service", "environment", "level", "component", "container"]
+  }
+}
+
+loki.source.docker "observability" {
+  host          = "unix:///var/run/docker.sock"
+  targets       = discovery.relabel.observability.output
+  forward_to    = [loki.process.observability.receiver]
+  labels        = { service = "observability" }
+  relabel_rules = discovery.relabel.observability.rules
+}
+
+loki.process "observability" {
+  forward_to = [loki.write.local.receiver]
+
+  stage.label_keep {
+    values = ["service", "environment", "level", "component", "container"]
+  }
+}
+
+loki.write "local" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import base64
+from time import perf_counter
 from typing import Any
 
 import httpx
+import structlog
 
 from app.core.config import Settings
 from app.core.exceptions import ContentError, TransientExternalError
+
+logger = structlog.get_logger(__name__)
 
 
 class DeepSeekClient:
@@ -50,6 +54,7 @@ class DeepSeekClient:
         return await self._request([{"role": "user", "content": content}])
 
     async def _request(self, messages: list[dict[str, Any]]) -> str:
+        started_at = perf_counter()
         try:
             response = await self._client.post(
                 f"{self._base_url}/chat/completions",
@@ -57,21 +62,43 @@ class DeepSeekClient:
                 json={"model": self._model, "messages": messages},
             )
         except (httpx.ConnectError, httpx.ReadTimeout, httpx.TimeoutException) as error:
+            self._log_failed_request(started_at, retryable=True, error_code="deepseek_temporary_failure")
             raise TransientExternalError(
                 "deepseek_temporary_failure",
                 "Сервис распознавания временно недоступен.",
             ) from error
 
         if response.status_code == 429 or response.status_code >= 500:
+            self._log_failed_request(
+                started_at,
+                status_code=response.status_code,
+                retryable=True,
+                error_code="deepseek_temporary_failure",
+            )
             raise TransientExternalError(
                 "deepseek_temporary_failure",
                 "Сервис распознавания временно недоступен.",
             )
         if response.status_code >= 400:
+            self._log_failed_request(
+                started_at,
+                status_code=response.status_code,
+                retryable=False,
+                error_code="deepseek_request_rejected",
+            )
             raise ContentError(
                 "deepseek_request_rejected", "Сервис распознавания отклонил материал."
             )
 
+        logger.info(
+            "external_request.completed",
+            provider="deepseek",
+            operation="chat_completion",
+            duration_ms=round((perf_counter() - started_at) * 1000, 2),
+            outcome="success",
+            status_code=response.status_code,
+            model=self._model,
+        )
         try:
             payload = response.json()
             content = payload["choices"][0]["message"]["content"]
@@ -86,3 +113,24 @@ class DeepSeekClient:
                 "empty_content", "В материале нет извлекаемого содержимого."
             )
         return content.strip()
+
+    def _log_failed_request(
+        self,
+        started_at: float,
+        *,
+        retryable: bool,
+        error_code: str,
+        status_code: int | None = None,
+    ) -> None:
+        fields: dict[str, Any] = {
+            "provider": "deepseek",
+            "operation": "chat_completion",
+            "duration_ms": round((perf_counter() - started_at) * 1000, 2),
+            "outcome": "failure",
+            "model": self._model,
+            "retryable": retryable,
+            "error_code": error_code,
+        }
+        if status_code is not None:
+            fields["status_code"] = status_code
+        logger.warning("external_request.failed", **fields)

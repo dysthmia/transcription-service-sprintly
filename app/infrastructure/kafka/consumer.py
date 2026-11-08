@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import json
-import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
+import structlog
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from aiokafka.structs import OffsetAndMetadata, TopicPartition
 from pydantic import ValidationError
@@ -21,7 +21,7 @@ from app.infrastructure.kafka.schemas import (
     YouTubeSource,
 )
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 def _kafka_connection_options(settings: Settings) -> dict[str, Any]:
@@ -79,11 +79,16 @@ class MaterialUploadedConsumer:
     async def run(self) -> None:
         """Обрабатывает сообщения, пока вызывающая задача не будет отменена."""
         await self.start()
+        logger.info("component.started", component="kafka.consumer")
         try:
             async for message in self._messages():
                 await self.handle_message(message)
+        except Exception as error:
+            logger.error("kafka.consumer.failed", exc_info=error)
+            raise
         finally:
             await self.stop()
+            logger.info("component.stopped", component="kafka.consumer")
 
     async def handle_message(self, message: Any) -> None:
         """Регистрирует сообщение и подтверждает offset только после сохранения."""
@@ -95,7 +100,27 @@ class MaterialUploadedConsumer:
             await self._commit_offset(message)
             return
 
-        await self._register_job(event)
+        logger.info(
+            "kafka.message.received",
+            job_id=event.job_id,
+            correlation_id=event.correlation_id,
+            material_id=event.material_id,
+        )
+        is_new_job = await self._register_job(event)
+        if is_new_job:
+            logger.info(
+                "job.registered",
+                job_id=event.job_id,
+                correlation_id=event.correlation_id,
+                material_id=event.material_id,
+            )
+        else:
+            logger.info(
+                "kafka.message.duplicate",
+                job_id=event.job_id,
+                correlation_id=event.correlation_id,
+                material_id=event.material_id,
+            )
         await self._commit_offset(message)
 
     async def _messages(self) -> AsyncIterator[Any]:
@@ -151,14 +176,10 @@ class MaterialUploadedConsumer:
             self._settings.kafka_input_dlq_topic,
             json.dumps(diagnostic, ensure_ascii=False).encode("utf-8"),
         )
-        logger.warning(
-            "Invalid Kafka payload sent to input DLQ: topic=%s partition=%s offset=%s",
-            message.topic,
-            message.partition,
-            message.offset,
-        )
+        logger.warning("kafka.message.sent_to_dlq", error_code="invalid_payload")
 
     async def _commit_offset(self, message: Any) -> None:
         topic_partition = TopicPartition(message.topic, message.partition)
         offset = OffsetAndMetadata(message.offset + 1, "")
         await self._consumer.commit({topic_partition: offset})
+        logger.debug("kafka.offset.committed")

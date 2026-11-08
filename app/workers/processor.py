@@ -6,18 +6,24 @@ import tempfile
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 from uuid import uuid4
+
+import structlog
 
 from app.core.config import Settings
 from app.core.database import Database
 from app.core.exceptions import ContentError, TranscriptError, TransientExternalError
+from app.core.logging import bind_log_context, clear_log_context
 from app.features.extraction.service import ExtractionService
 from app.features.jobs.models import JobStage, TranscriptionJob
 from app.features.jobs.repository import JobsRepository
 from app.features.jobs.schemas import NewOutboxEvent
 from app.features.summarization.service import SummarizationService
 from app.infrastructure.s3.client import S3Client
+
+logger = structlog.get_logger(__name__)
 
 
 class JobProcessor:
@@ -49,6 +55,14 @@ class JobProcessor:
         if job is None:
             return False
 
+        bind_log_context(
+            job_id=job.job_id,
+            correlation_id=job.correlation_id,
+            material_id=job.material_id,
+            attempt=job.attempt_count,
+            pipeline_version=job.pipeline_version,
+        )
+        logger.info("job.claimed")
         await self._process_claimed_job(job)
         return True
 
@@ -59,35 +73,48 @@ class JobProcessor:
 
     async def _process_claimed_job(self, job: TranscriptionJob) -> None:
         current_stage = JobStage.DOWNLOAD
-        temporary_directory = self._temporary_directory(prefix=f"transcript-job-{job.job_id}-")
-        workdir = Path(temporary_directory.name)
+        temporary_directory: tempfile.TemporaryDirectory[str] | None = None
         try:
-            await self._start_stage(job.job_id, current_stage)
-            source = await self._download_source(job, workdir)
+            temporary_directory = self._temporary_directory(prefix=f"transcript-job-{job.job_id}-")
+            workdir = Path(temporary_directory.name)
+            processing_started_at = perf_counter()
+            logger.info("job.processing.started")
+            source = await self._run_stage(
+                job, current_stage, lambda: self._download_source(job, workdir)
+            )
 
             current_stage = JobStage.EXTRACT
-            await self._start_stage(job.job_id, current_stage)
-            extracted = await self._extraction_service.extract(source)
+            extracted = await self._run_stage(
+                job, current_stage, lambda: self._extraction_service.extract(source)
+            )
 
             current_stage = JobStage.CLEAN
-            await self._start_stage(job.job_id, current_stage)
-            cleaned_content = self._clean_content(extracted.content)
+            cleaned_content = await self._run_stage(
+                job, current_stage, lambda: self._clean_content(extracted.content)
+            )
 
             current_stage = JobStage.SUMMARIZE
-            await self._start_stage(job.job_id, current_stage)
-            summary = await self._summarization_service.summarize(cleaned_content)
+            summary = await self._run_stage(
+                job,
+                current_stage,
+                lambda: self._summarization_service.summarize(cleaned_content),
+            )
 
             current_stage = JobStage.UPLOAD
-            await self._start_stage(job.job_id, current_stage)
             summary_key = self._summary_key(job)
-            await self._s3_client.upload_text(
-                summary,
-                summary_key,
-                bucket=self._settings.s3_output_bucket,
+            await self._run_stage(
+                job,
+                current_stage,
+                lambda: self._s3_client.upload_text(
+                    summary,
+                    summary_key,
+                    bucket=self._settings.s3_output_bucket,
+                ),
             )
         except TranscriptError as error:
             await self._handle_error(job, current_stage, error)
-        except Exception:  # noqa: BLE001 - unexpected errors must release the job via retry.
+        except Exception as error:
+            logger.error("job.unexpected_error", exc_info=error)
             await self._handle_error(
                 job,
                 current_stage,
@@ -97,9 +124,33 @@ class JobProcessor:
                 ),
             )
         else:
-            await self._complete_job(job, summary_key)
+            await self._complete_job(
+                job,
+                summary_key,
+                duration_ms=round((perf_counter() - processing_started_at) * 1000, 2),
+            )
         finally:
-            temporary_directory.cleanup()
+            if temporary_directory is not None:
+                temporary_directory.cleanup()
+            clear_log_context()
+
+    async def _run_stage(
+        self,
+        job: TranscriptionJob,
+        stage: JobStage,
+        operation: Callable[[], Any],
+    ) -> Any:
+        started_at = perf_counter()
+        await self._start_stage(job.job_id, stage)
+        result = operation()
+        if hasattr(result, "__await__"):
+            result = await result
+        logger.info(
+            "job.stage.completed",
+            stage=stage.value,
+            duration_ms=round((perf_counter() - started_at) * 1000, 2),
+        )
+        return result
 
     async def _download_source(self, job: TranscriptionJob, workdir: Path) -> Path | str:
         if job.source_url:
@@ -125,6 +176,7 @@ class JobProcessor:
                 job_id, stage, self._lease_for
             )
         if not updated:
+            logger.warning("job.lease.lost", stage=stage.value, error_code="lease_lost")
             raise TransientExternalError(
                 "lease_lost", "Не удалось продлить аренду задания."
             )
@@ -153,8 +205,15 @@ class JobProcessor:
                 error_code=error.error_code,
                 error_message=error.user_message,
             )
+        logger.warning(
+            "job.retry.scheduled",
+            error_code=error.error_code,
+            retryable=True,
+        )
 
-    async def _complete_job(self, job: TranscriptionJob, summary_key: str) -> None:
+    async def _complete_job(
+        self, job: TranscriptionJob, summary_key: str, *, duration_ms: float
+    ) -> None:
         event_id = str(uuid4())
         event = NewOutboxEvent(
             event_id=event_id,
@@ -184,6 +243,7 @@ class JobProcessor:
                 models=dict(job.models),
                 event=event,
             )
+        logger.info("job.completed", duration_ms=duration_ms)
 
     async def _fail_job(
         self, job: TranscriptionJob, stage: JobStage, error: TranscriptError
@@ -216,6 +276,13 @@ class JobProcessor:
                 error_message=error.user_message,
                 event=event,
             )
+        log_method = logger.warning if isinstance(error, ContentError) else logger.error
+        log_method(
+            "job.failed",
+            stage=stage.value,
+            error_code=error.error_code,
+            retryable=False,
+        )
 
     @staticmethod
     def _summary_key(job: TranscriptionJob) -> str:

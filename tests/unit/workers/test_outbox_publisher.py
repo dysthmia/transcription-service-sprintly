@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from app.core.exceptions import TransientExternalError
+from app.core.logging import configure_logging
 from app.workers.outbox_publisher import OutboxPublisher
 
 
@@ -135,3 +136,21 @@ async def test_retry_publishes_the_same_event_id_again() -> None:
         "evt-1",
     ]
     assert repository.marked == ["evt-1"]
+
+
+@pytest.mark.asyncio
+async def test_logs_outbox_success_and_retry(capsys: pytest.CaptureFixture[str]) -> None:
+    configure_logging("INFO", log_format="json")
+    calls: list[str] = []
+    success_repository = FakeRepository([event()], calls)
+    await publisher(success_repository, FakeKafkaProducer([None], calls)).publish_pending()
+    assert '"event": "outbox.publish.completed"' in capsys.readouterr().out
+
+    retry_repository = FakeRepository([event()], calls)
+    await publisher(
+        retry_repository,
+        FakeKafkaProducer([TransientExternalError("kafka_unavailable", "retry")], calls),
+    ).publish_pending()
+    output = capsys.readouterr().out
+    assert '"event": "outbox.retry.scheduled"' in output
+    assert '"retryable": true' in output

@@ -9,7 +9,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
     volumes:
-      - ${PROJECT_ROOT:-.}/out/pgdata:/var/lib/postgresql/data
+      - ${DATA_ROOT:-./out}/pgdata:/var/lib/postgresql/data
     restart: always
     ports:
       - "${POSTGRES_HOST_PORT:-127.0.0.1:5433:5432}"
@@ -47,3 +47,93 @@ services:
     restart: unless-stopped
     init: true
     stop_grace_period: 30s
+    logging:
+      driver: local
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  loki:
+    image: grafana/loki:3.7.8
+    profiles: ["observability"]
+    command: ["-config.file=/etc/loki/config.yml"]
+    volumes:
+      - ./observability/loki/config.yml:/etc/loki/config.yml:ro
+      - ${DATA_ROOT:-./out}/observability/loki:/loki
+    restart: unless-stopped
+    healthcheck:
+      # Loki's distroless image intentionally has no shell or wget.
+      test: ["CMD", "/usr/bin/loki", "-verify-config=true", "-config.file=/etc/loki/config.yml"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+          cpus: "1.0"
+        reservations:
+          memory: 256M
+
+  alloy:
+    image: grafana/alloy:v1.21.3
+    profiles: ["observability"]
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    volumes:
+      - ./observability/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - ${DATA_ROOT:-./out}/observability/alloy:/var/lib/alloy/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      loki:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      # Alloy's distroless image intentionally has no shell or wget.
+      test: ["CMD", "/bin/alloy", "validate", "/etc/alloy/config.alloy"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "0.50"
+        reservations:
+          memory: 128M
+
+  grafana:
+    image: grafana/grafana:13.3.0
+    profiles: ["observability"]
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD in .env or the environment}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ${DATA_ROOT:-./out}/observability/grafana:/var/lib/grafana
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+    depends_on:
+      loki:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "0.50"
+        reservations:
+          memory: 128M

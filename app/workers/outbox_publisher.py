@@ -7,11 +7,15 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import structlog
+
 from app.core.config import Settings
 from app.core.database import Database
 from app.core.exceptions import TransientExternalError
 from app.features.jobs.repository import JobsRepository
 from app.infrastructure.kafka.producer import KafkaProducer
+
+logger = structlog.get_logger(__name__)
 
 
 class OutboxPublisher:
@@ -33,12 +37,14 @@ class OutboxPublisher:
     async def run(self) -> None:
         """Запускает периодическую публикацию до отмены задачи приложения."""
         await self._producer.start()
+        logger.info("component.started", component="outbox.publisher")
         try:
             while True:
                 await self.publish_pending()
                 await asyncio.sleep(self._settings.outbox_poll_interval_seconds)
         finally:
             await self._producer.stop()
+            logger.info("component.stopped", component="outbox.publisher")
 
     async def publish_pending(self) -> int:
         """Делает одну попытку опубликовать все доступные pending-события."""
@@ -47,11 +53,20 @@ class OutboxPublisher:
         for event in events:
             try:
                 await self._producer.publish(event.topic, event.partition_key, event.payload)
-            except TransientExternalError:
+            except TransientExternalError as error:
                 await self._schedule_retry(event.id, event.attempt_count)
+                logger.warning(
+                    "outbox.retry.scheduled",
+                    error_code=error.error_code,
+                    retryable=True,
+                )
+            except Exception as error:
+                logger.error("outbox.publish.failed", exc_info=error, retryable=False)
+                raise
             else:
                 await self._mark_published(event.id)
                 published_count += 1
+                logger.info("outbox.publish.completed")
         return published_count
 
     async def _pending_events(self) -> list[Any]:

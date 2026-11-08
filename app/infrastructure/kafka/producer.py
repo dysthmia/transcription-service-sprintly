@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import json
+from time import perf_counter
 from typing import Any
 
+import structlog
 from aiokafka import AIOKafkaProducer
 from aiokafka.errors import KafkaError
 
 from app.core.config import Settings
 from app.core.exceptions import TransientExternalError
+
+logger = structlog.get_logger(__name__)
 
 
 def _kafka_connection_options(settings: Settings) -> dict[str, Any]:
@@ -42,6 +46,7 @@ class KafkaProducer:
         self, topic: str, partition_key: str, payload: dict[str, Any]
     ) -> None:
         """Сериализует payload и ожидает broker acknowledgement."""
+        started_at = perf_counter()
         try:
             await self._producer.send_and_wait(
                 topic,
@@ -51,6 +56,22 @@ class KafkaProducer:
                 key=partition_key.encode("utf-8"),
             )
         except (KafkaError, TimeoutError) as error:
+            logger.warning(
+                "external_request.failed",
+                provider="kafka",
+                operation="publish",
+                duration_ms=round((perf_counter() - started_at) * 1000, 2),
+                outcome="failure",
+                retryable=True,
+                error_code="kafka_unavailable",
+            )
             raise TransientExternalError(
                 "kafka_unavailable", "Kafka временно недоступна для публикации события."
             ) from error
+        logger.info(
+            "external_request.completed",
+            provider="kafka",
+            operation="publish",
+            duration_ms=round((perf_counter() - started_at) * 1000, 2),
+            outcome="success",
+        )
