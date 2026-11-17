@@ -36,7 +36,12 @@ class S3Client:
     @asynccontextmanager
     async def _client(self) -> AsyncGenerator[Any, None]:
         # AsyncGenerator[S3Client, None] ?
-        config = Config(s3={"addressing_style": self._settings.s3_addressing_style})
+        config = Config(
+            s3={"addressing_style": self._settings.s3_addressing_style},
+            connect_timeout=self._settings.api_request_timeout_seconds,
+            read_timeout=self._settings.api_request_timeout_seconds,
+            retries={"max_attempts": 2, "mode": "standard"},
+        )
         async with self._session.client(
             "s3",
             endpoint_url=self._settings.s3_endpoint_url,
@@ -52,6 +57,8 @@ class S3Client:
         bucket: str,
         key: str,
         destination: Path | None = None,
+        *,
+        max_bytes: int | None = None,
     ) -> Path:
         """Метод скачивает объект из S3 на диск."""
         started_at = perf_counter()
@@ -67,7 +74,20 @@ class S3Client:
         try:
             async with self._client() as client:
                 response = await client.get_object(Bucket=bucket, Key=key)
-                await self._write_body(response["Body"], destination)
+                declared_size = response.get("ContentLength")
+                if (
+                    max_bytes is not None
+                    and isinstance(declared_size, int)
+                    and declared_size > max_bytes
+                ):
+                    raise ContentError(
+                        "file_too_large", "Превышен допустимый размер исходного файла."
+                    )
+                await self._write_body(response["Body"], destination, max_bytes=max_bytes)
+        except ContentError:
+            if is_temporary:
+                destination.unlink(missing_ok=True)
+            raise
         except (
             ClientError,
             ConnectionClosedError,
@@ -201,15 +221,24 @@ class S3Client:
             fields["status_code"] = status_code
         logger.warning("external_request.failed", **fields)
 
-    async def _write_body(self, body: Any, destination: Path) -> None:
+    async def _write_body(
+        self, body: Any, destination: Path, *, max_bytes: int | None = None
+    ) -> None:
         """Вызывается из download_file() и сохраняет скачиваемые данные на диск"""
         try:
             # Открывает файл для записи в бинарном режиме.
             # w - запись с перезаписью содержимого.
             # b — работа с байтами.
             with destination.open("wb") as output:
+                received_bytes = 0
                 # читает данные частями по 1 МБ
                 while chunk := await body.read(1024 * 1024):
+                    received_bytes += len(chunk)
+                    if max_bytes is not None and received_bytes > max_bytes:
+                        raise ContentError(
+                            "file_too_large",
+                            "Превышен допустимый размер исходного файла.",
+                        )
                     await asyncio.to_thread(output.write, chunk)
         finally:
             # Гарантирует попытку закрытия сетевого потока
@@ -244,7 +273,9 @@ class S3Client:
                 raise TransientExternalError(
                     "s3_temporary_failure", "Хранилище временно недоступно."
                 ) from error
-            raise error
+            raise ContentError(
+                "s3_access_denied", "Нет доступа к требуемому объекту в хранилище."
+            ) from error
 
         if isinstance(
             error,

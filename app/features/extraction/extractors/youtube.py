@@ -6,6 +6,7 @@ import asyncio
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
+from time import monotonic
 from typing import Protocol
 
 import yt_dlp
@@ -25,11 +26,32 @@ class AudioDownloader(Protocol):
 class YtDlpAudioDownloader:
     """Минимальная обёртка над yt-dlp без cookies, прокси и обходов доступа."""
 
+    def __init__(self, max_file_size_bytes: int, timeout_seconds: int) -> None:
+        self._max_file_size_bytes = max_file_size_bytes
+        self._timeout_seconds = timeout_seconds
+
     async def download(self, source_url: str, destination: Path) -> Path:
-        return await asyncio.to_thread(self._download, source_url, destination)
+        return await asyncio.to_thread(
+            self._download,
+            source_url,
+            destination,
+            self._max_file_size_bytes,
+            self._timeout_seconds,
+        )
 
     @staticmethod
-    def _download(source_url: str, destination: Path) -> Path:
+    def _download(
+        source_url: str,
+        destination: Path,
+        max_file_size_bytes: int,
+        timeout_seconds: int,
+    ) -> Path:
+        deadline = monotonic() + timeout_seconds
+
+        def stop_after_deadline(_: dict[str, object]) -> None:
+            if monotonic() >= deadline:
+                raise yt_dlp.utils.DownloadError("download timed out")
+
         options: dict[str, object] = {
             "format": "bestaudio",
             "outtmpl": str(destination / "audio.%(ext)s"),
@@ -37,6 +59,11 @@ class YtDlpAudioDownloader:
             "quiet": True,
             "no_warnings": True,
             "noprogress": True,
+            "max_filesize": max_file_size_bytes,
+            "socket_timeout": min(timeout_seconds, 60),
+            "retries": 2,
+            "fragment_retries": 2,
+            "progress_hooks": [stop_after_deadline],
         }
         try:
             with yt_dlp.YoutubeDL(options) as downloader:
@@ -88,12 +115,17 @@ class YoutubeExtractor:
         self,
         audio_pipeline: AudioPipeline,
         downloader: AudioDownloader | None = None,
+        *,
+        max_file_size_bytes: int = 200 * 1024 * 1024,
+        download_timeout_seconds: int = 300,
         temporary_directory: Callable[
             ..., tempfile.TemporaryDirectory[str]
         ] = tempfile.TemporaryDirectory,
     ) -> None:
         self._audio_pipeline = audio_pipeline
-        self._downloader = downloader or YtDlpAudioDownloader()
+        self._downloader = downloader or YtDlpAudioDownloader(
+            max_file_size_bytes, download_timeout_seconds
+        )
         self._temporary_directory = temporary_directory
 
     async def extract(self, source_url: str) -> ExtractionResult:

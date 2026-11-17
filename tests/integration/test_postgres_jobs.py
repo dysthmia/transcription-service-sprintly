@@ -12,7 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.features.extraction.base import DetectedType, ExtractionResult
-from app.features.jobs.models import JobStatus, OutboxEvent, TranscriptionJob
+from app.features.jobs.models import JobStage, JobStatus, OutboxEvent, TranscriptionJob
 from app.features.jobs.repository import JobsRepository
 from app.features.jobs.schemas import NewJob, NewOutboxEvent
 from app.workers.processor import JobProcessor
@@ -50,11 +50,13 @@ async def register_job(
 async def claim_job(
     session_factory: async_sessionmaker[AsyncSession],
     job_id: str,
-) -> None:
+) -> str:
     async with session_factory() as session, session.begin():
         claimed = await JobsRepository(session).claim_next_job(timedelta(minutes=5))
         assert claimed is not None
         assert claimed.job_id == job_id
+        assert claimed.lease_token is not None
+        return claimed.lease_token
 
 
 async def job_count(session_factory: async_sessionmaker[AsyncSession]) -> int:
@@ -82,7 +84,7 @@ async def test_alembic_migration_creates_job_tables(
         version = await session.scalar(text("SELECT version_num FROM alembic_version"))
 
     assert tables == {"transcription_jobs", "processed_events", "outbox_events"}
-    assert version == "0001_create_jobs_tables"
+    assert version == "0002_add_job_lease_token"
 
 
 @pytest.mark.asyncio
@@ -130,15 +132,45 @@ async def test_claim_uses_skip_locked_for_concurrent_workers(
 
 
 @pytest.mark.asyncio
+async def test_expired_lease_cannot_be_extended_by_previous_owner(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await register_job(session_factory, "event-1", new_job("job-1"))
+    first_token = await claim_job(session_factory, "job-1")
+
+    async with session_factory() as session, session.begin():
+        await session.execute(
+            update(TranscriptionJob)
+            .where(TranscriptionJob.job_id == "job-1")
+            .values(locked_until=datetime.now(UTC) - timedelta(seconds=1))
+        )
+
+    async with session_factory() as session, session.begin():
+        replacement = await JobsRepository(session).claim_next_job(timedelta(minutes=5))
+        assert replacement is not None
+        assert replacement.lease_token is not None
+        second_token = replacement.lease_token
+
+    async with session_factory() as session, session.begin():
+        stale_update = await JobsRepository(session).update_stage_and_extend_lease(
+            "job-1", first_token, JobStage.EXTRACT, timedelta(minutes=5)
+        )
+
+    assert not stale_update
+    assert first_token != second_token
+
+
+@pytest.mark.asyncio
 async def test_retry_wait_job_is_claimed_only_after_retry_time(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     await register_job(session_factory, "event-1", new_job("job-1"))
-    await claim_job(session_factory, "job-1")
+    lease_token = await claim_job(session_factory, "job-1")
 
     async with session_factory() as session, session.begin():
         await JobsRepository(session).move_to_retry_wait(
             "job-1",
+            lease_token,
             retry_at=datetime.now(UTC) + timedelta(minutes=1),
             error_code="temporary_failure",
             error_message="Temporary failure",
@@ -166,7 +198,7 @@ async def test_complete_and_fail_create_outbox_rows_atomically(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     await register_job(session_factory, "event-complete", new_job("job-complete"))
-    await claim_job(session_factory, "job-complete")
+    complete_lease_token = await claim_job(session_factory, "job-complete")
     complete_event = NewOutboxEvent(
         event_id="outbox-complete",
         topic="transcript.events",
@@ -177,14 +209,16 @@ async def test_complete_and_fail_create_outbox_rows_atomically(
     async with session_factory() as session:
         await JobsRepository(session).complete_job_with_outbox(
             "job-complete",
+            complete_lease_token,
             summary_bucket="summaries",
             summary_key="summaries/job-complete.md",
+            detected_type="txt",
             models={},
             event=complete_event,
         )
 
     await register_job(session_factory, "event-fail", new_job("job-fail"))
-    await claim_job(session_factory, "job-fail")
+    failed_lease_token = await claim_job(session_factory, "job-fail")
     failed_event = NewOutboxEvent(
         event_id="outbox-fail",
         topic="transcript.events",
@@ -195,6 +229,7 @@ async def test_complete_and_fail_create_outbox_rows_atomically(
     async with session_factory() as session:
         await JobsRepository(session).fail_job_with_outbox(
             "job-fail",
+            failed_lease_token,
             error_code="empty_content",
             error_message="No content",
             event=failed_event,
@@ -222,7 +257,7 @@ async def test_outbox_unique_event_type_rolls_back_completion(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     await register_job(session_factory, "event-1", new_job("job-1"))
-    await claim_job(session_factory, "job-1")
+    lease_token = await claim_job(session_factory, "job-1")
 
     async with session_factory() as session, session.begin():
         session.add(
@@ -240,8 +275,10 @@ async def test_outbox_unique_event_type_rolls_back_completion(
         with pytest.raises(IntegrityError):
             await JobsRepository(session).complete_job_with_outbox(
                 "job-1",
+                lease_token,
                 summary_bucket="summaries",
                 summary_key="summaries/job-1.md",
+                detected_type="txt",
                 models={},
                 event=NewOutboxEvent(
                     event_id="duplicate-event",
@@ -275,7 +312,9 @@ class FakeS3:
     def __init__(self) -> None:
         self.uploads: list[tuple[str, str, str | None]] = []
 
-    async def download_file(self, bucket: str, key: str, destination: Path) -> Path:
+    async def download_file(
+        self, bucket: str, key: str, destination: Path, **_: Any
+    ) -> Path:
         destination.write_text("source", encoding="utf-8")
         return destination
 
@@ -309,6 +348,7 @@ async def test_processor_happy_path_persists_completed_job_and_outbox(
             job_max_attempts=3,
             s3_output_bucket="summaries",
             kafka_output_topic="transcript.events",
+            max_source_file_size_mb=200,
         ),
         DatabaseFromSessionFactory(session_factory),
         s3,

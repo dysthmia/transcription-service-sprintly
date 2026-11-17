@@ -47,6 +47,17 @@ services:
     restart: unless-stopped
     init: true
     stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          memory: 3G
+          cpus: "2.0"
+        reservations:
+          memory: 512M
     logging:
       driver: local
       options:

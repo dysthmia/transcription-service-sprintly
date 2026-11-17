@@ -81,6 +81,19 @@ def test_material_uploaded_rejects_wrong_event_type() -> None:
         )
 
 
+def test_material_uploaded_rejects_identifier_that_database_cannot_store() -> None:
+    with pytest.raises(ValidationError, match="event_id"):
+        MaterialUploadedEvent.model_validate(
+            {
+                **COMMON_FIELDS,
+                "event_id": "e" * 256,
+                "event_type": "material_uploaded",
+                "material_id": "material-1",
+                "source": {"type": "s3", "bucket": "materials", "key": "source.txt"},
+            }
+        )
+
+
 def test_outbound_events_serialize_to_json_compatible_dicts() -> None:
     summary_event = SummaryGeneratedEvent.model_validate(
         {

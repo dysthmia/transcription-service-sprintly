@@ -27,12 +27,14 @@ class MediaExtractor:
         max_file_size_mb: int,
         max_duration_seconds: int,
         chunk_seconds: int,
+        command_timeout_seconds: int = 300,
     ) -> None:
         self._stt_client = stt_client
         self.detected_type = detected_type
         self._max_file_size_bytes = max_file_size_mb * 1024 * 1024
         self._max_duration_seconds = max_duration_seconds
         self._chunk_seconds = chunk_seconds
+        self._command_timeout_seconds = command_timeout_seconds
 
     async def extract(self, source: Path) -> ExtractionResult:
         self._check_file_size(source)
@@ -99,11 +101,15 @@ class MediaExtractor:
             raise ContentError("invalid_media", "Не удалось подготовить части аудио.")
         return chunks
 
-    @staticmethod
-    async def _run_command(command: list[str]) -> subprocess.CompletedProcess[str]:
+    async def _run_command(self, command: list[str]) -> subprocess.CompletedProcess[str]:
         try:
             return await asyncio.to_thread(
-                subprocess.run, command, check=True, capture_output=True, text=True
+                subprocess.run,
+                command,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=self._command_timeout_seconds,
             )
-        except (OSError, subprocess.CalledProcessError) as error:
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
             raise ContentError("invalid_media", "Не удалось обработать медиафайл.") from error

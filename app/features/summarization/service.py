@@ -40,8 +40,29 @@ class SummarizationService:
             await self._complete(build_chunk_summary_prompt(chunk, number, len(chunks)))
             for number, chunk in enumerate(chunks, start=1)
         ]
-        merged_parts = _remove_exact_duplicate_blocks(partial_summaries)
-        return await self._complete(build_merge_prompt(merged_parts))
+        return await self._merge_parts(_remove_exact_duplicate_blocks(partial_summaries))
+
+    async def _merge_parts(self, parts: list[str]) -> str:
+        """Сводит части деревом, не переполняя контекст финального запроса."""
+        current = parts
+        merge_budget = max(1_000, int(self._chunk_size * 0.8))
+        for _ in range(8):
+            if len(current) <= 1:
+                return current[0]
+            groups = _group_parts(current, merge_budget)
+            if len(groups) == len(current):
+                raise ContentError(
+                    "llm_output_too_large",
+                    "Промежуточный конспект превышает безопасный размер объединения.",
+                )
+            current = [
+                await self._complete(build_merge_prompt(group))
+                for group in groups
+            ]
+        raise ContentError(
+            "llm_output_too_large",
+            "Не удалось объединить большой материал в допустимый размер.",
+        )
 
     async def _complete(self, prompt: str) -> str:
         try:
@@ -79,3 +100,21 @@ def _remove_exact_duplicate_blocks(parts: list[str]) -> list[str]:
         if unique_blocks:
             unique_parts.append("\n\n".join(unique_blocks))
     return unique_parts
+
+
+def _group_parts(parts: list[str], max_chars: int) -> list[list[str]]:
+    """Группирует уже сжатые части для многоуровневого merge."""
+    groups: list[list[str]] = []
+    current: list[str] = []
+    current_length = 0
+    for part in parts:
+        separator_length = 2 if current else 0
+        if current and current_length + separator_length + len(part) > max_chars:
+            groups.append(current)
+            current = []
+            current_length = 0
+        current.append(part)
+        current_length += separator_length + len(part)
+    if current:
+        groups.append(current)
+    return groups

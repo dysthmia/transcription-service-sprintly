@@ -53,12 +53,16 @@ class FakeS3Api:
         self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
         self.body = FakeBody([b"part one", b" part two"])
         self.error: Exception | None = None
+        self.content_length: int | None = None
 
     async def get_object(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(("get_object", (), kwargs))
         if self.error is not None:
             raise self.error
-        return {"Body": self.body}
+        response: dict[str, Any] = {"Body": self.body}
+        if self.content_length is not None:
+            response["ContentLength"] = self.content_length
+        return response
 
     async def upload_file(self, *args: Any) -> None:
         self.calls.append(("upload_file", args, {}))
@@ -81,6 +85,7 @@ def s3_settings() -> SimpleNamespace:
         s3_secret_access_key=SecretStr("secret-key"),
         s3_output_bucket="output-bucket",
         s3_addressing_style="auto",
+        api_request_timeout_seconds=30,
     )
 
 
@@ -107,6 +112,32 @@ async def test_download_file_uses_source_bucket_and_key(
     assert fake_api.calls == [
         ("get_object", (), {"Bucket": "source-bucket", "Key": "materials/source.pdf"})
     ]
+    assert fake_api.body.closed
+
+
+async def test_download_rejects_declared_source_larger_than_limit(
+    s3_client: S3Client, fake_api: FakeS3Api, tmp_path: Path
+) -> None:
+    fake_api.content_length = 11
+
+    with pytest.raises(ContentError, match="file_too_large"):
+        await s3_client.download_file(
+            "source-bucket", "large.mp4", tmp_path / "large.mp4", max_bytes=10
+        )
+
+    assert not (tmp_path / "large.mp4").exists()
+
+
+async def test_download_stops_unknown_length_stream_at_limit(
+    s3_client: S3Client, fake_api: FakeS3Api, tmp_path: Path
+) -> None:
+    fake_api.body = FakeBody([b"12345", b"67890", b"1"])
+
+    with pytest.raises(ContentError, match="file_too_large"):
+        await s3_client.download_file(
+            "source-bucket", "large.mp4", tmp_path / "large.mp4", max_bytes=10
+        )
+
     assert fake_api.body.closed
 
 

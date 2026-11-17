@@ -43,19 +43,26 @@ class FakeRepository:
         return self.job
 
     async def update_stage_and_extend_lease(
-        self, job_id: str, stage: Any, lease_for: timedelta
+        self, job_id: str, lease_token: str, stage: Any, lease_for: timedelta
     ) -> bool:
         self.stages.append((job_id, stage.value, lease_for))
         return True
 
-    async def move_to_retry_wait(self, job_id: str, **kwargs: Any) -> bool:
+    async def extend_lease(self, *_: Any) -> bool:
+        return True
+
+    async def move_to_retry_wait(self, job_id: str, lease_token: str, **kwargs: Any) -> bool:
         self.retries.append({"job_id": job_id, **kwargs})
         return True
 
-    async def complete_job_with_outbox(self, job_id: str, **kwargs: Any) -> None:
+    async def complete_job_with_outbox(
+        self, job_id: str, lease_token: str, **kwargs: Any
+    ) -> None:
         self.completed.append({"job_id": job_id, **kwargs})
 
-    async def fail_job_with_outbox(self, job_id: str, **kwargs: Any) -> None:
+    async def fail_job_with_outbox(
+        self, job_id: str, lease_token: str, **kwargs: Any
+    ) -> None:
         self.failed.append({"job_id": job_id, **kwargs})
 
 
@@ -64,7 +71,9 @@ class FakeS3:
         self.downloads: list[tuple[str, str, Path]] = []
         self.uploads: list[tuple[str, str, str | None]] = []
 
-    async def download_file(self, bucket: str, key: str, destination: Path) -> Path:
+    async def download_file(
+        self, bucket: str, key: str, destination: Path, **_: Any
+    ) -> Path:
         self.downloads.append((bucket, key, destination))
         destination.write_text("source", encoding="utf-8")
         return destination
@@ -114,6 +123,7 @@ def settings() -> SimpleNamespace:
         job_max_attempts=3,
         s3_output_bucket="summaries",
         kafka_output_topic="transcript.events",
+        max_source_file_size_mb=200,
     )
 
 
@@ -129,6 +139,7 @@ def job(*, attempt_count: int = 1) -> SimpleNamespace:
         attempt_count=attempt_count,
         pipeline_version="v1",
         models={},
+        lease_token="lease-token-1",
     )
 
 

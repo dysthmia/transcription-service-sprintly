@@ -106,6 +106,13 @@ class MaterialUploadedConsumer:
             correlation_id=event.correlation_id,
             material_id=event.material_id,
         )
+        allowed_source_buckets = getattr(self._settings, "allowed_source_buckets", frozenset())
+        if isinstance(event.source, S3Source) and (
+            allowed_source_buckets and event.source.bucket not in allowed_source_buckets
+        ):
+            await self._send_to_dlq(message, error_code="source_bucket_not_allowed")
+            await self._commit_offset(message)
+            return
         is_new_job = await self._register_job(event)
         if is_new_job:
             logger.info(
@@ -163,11 +170,11 @@ class MaterialUploadedConsumer:
             source_url=source.url,
         )
 
-    async def _send_to_dlq(self, message: Any) -> None:
+    async def _send_to_dlq(self, message: Any, *, error_code: str = "invalid_payload") -> None:
         """Публикует диагностику, не содержащую тело невалидного сообщения."""
         diagnostic = {
             "event_type": "invalid_material_uploaded",
-            "error_code": "invalid_payload",
+            "error_code": error_code,
             "source_topic": message.topic,
             "source_partition": message.partition,
             "source_offset": message.offset,
@@ -176,7 +183,7 @@ class MaterialUploadedConsumer:
             self._settings.kafka_input_dlq_topic,
             json.dumps(diagnostic, ensure_ascii=False).encode("utf-8"),
         )
-        logger.warning("kafka.message.sent_to_dlq", error_code="invalid_payload")
+        logger.warning("kafka.message.sent_to_dlq", error_code=error_code)
 
     async def _commit_offset(self, message: Any) -> None:
         topic_partition = TopicPartition(message.topic, message.partition)

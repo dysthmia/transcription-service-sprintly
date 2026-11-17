@@ -17,6 +17,8 @@ def settings() -> SimpleNamespace:
         max_media_file_size_mb=2,
         max_media_duration_seconds=60,
         stt_chunk_seconds=30,
+        max_source_file_size_mb=2,
+        youtube_download_timeout_seconds=60,
     )
 
 
@@ -91,7 +93,7 @@ async def test_youtube_source_routes_directly_to_youtube_extractor(
     created_with: list[object] = []
 
     class FakeYoutubeExtractor:
-        def __init__(self, audio_pipeline: object) -> None:
+        def __init__(self, audio_pipeline: object, **_: object) -> None:
             created_with.append(audio_pipeline)
 
         async def extract(self, source_url: str) -> ExtractionResult:

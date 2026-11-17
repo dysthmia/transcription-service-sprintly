@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from dataclasses import replace
 from pathlib import Path
@@ -37,14 +38,14 @@ class ExtractionService:
         if isinstance(source, str):
             return self._normalize_result(await self.extract_youtube(source))
 
-        detected_type = detect_type(source)
+        detected_type = await asyncio.to_thread(detect_type, source)
 
         if detected_type is DetectedType.TXT:
             self._check_document_file_size(source)
-            result = TxtExtractor().extract(source)
+            result = await asyncio.to_thread(TxtExtractor().extract, source)
         elif detected_type is DetectedType.DOCX:
             self._check_document_file_size(source)
-            result = DocxExtractor().extract(source)
+            result = await asyncio.to_thread(DocxExtractor().extract, source)
         elif detected_type is DetectedType.PDF:
             self._check_document_file_size(source)
             result = await PdfExtractor(
@@ -66,7 +67,9 @@ class ExtractionService:
     async def extract_youtube(self, source_url: str) -> ExtractionResult:
         """Скачивает разрешённую аудиодорожку YouTube и передаёт её в общий STT pipeline."""
         return await YoutubeExtractor(
-            self._media_extractor(DetectedType.YOUTUBE)
+            self._media_extractor(DetectedType.YOUTUBE),
+            max_file_size_bytes=self._settings.max_source_file_size_mb * 1024 * 1024,
+            download_timeout_seconds=self._settings.youtube_download_timeout_seconds,
         ).extract(source_url)
 
     def _media_extractor(self, detected_type: DetectedType) -> MediaExtractor:
@@ -82,6 +85,7 @@ class ExtractionService:
             self._settings.max_media_file_size_mb,
             self._settings.max_media_duration_seconds,
             self._settings.stt_chunk_seconds,
+            getattr(self._settings, "media_command_timeout_seconds", 300),
         )
 
     def _check_document_file_size(self, source: Path) -> None:

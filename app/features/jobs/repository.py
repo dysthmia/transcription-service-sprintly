@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from uuid import uuid4
 
 from sqlalchemy import Select, and_, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
@@ -100,6 +101,7 @@ class JobsRepository:
         job.current_stage = JobStage.DOWNLOAD.value
         job.attempt_count += 1
         job.locked_until = now + lease_for
+        job.lease_token = str(uuid4())
         job.started_at = job.started_at or now
         job.next_retry_at = None
         # flush() отправляет изменения в PostgreSQL в рамках текущей транзакции, но не завершает её.
@@ -118,7 +120,7 @@ class JobsRepository:
         return result.rowcount == 1
 
     async def update_stage_and_extend_lease(
-        self, job_id: str, stage: JobStage, lease_for: timedelta
+        self, job_id: str, lease_token: str, stage: JobStage, lease_for: timedelta
     ) -> bool:
         """Фиксирует этап и продлевает аренду job перед долгой операцией."""
         result = await self._session.execute(
@@ -126,6 +128,8 @@ class JobsRepository:
             .where(
                 TranscriptionJob.job_id == job_id,
                 TranscriptionJob.status == JobStatus.PROCESSING.value,
+                TranscriptionJob.lease_token == lease_token,
+                TranscriptionJob.locked_until > datetime.now(UTC),
             )
             .values(
                 current_stage=stage.value,
@@ -134,9 +138,26 @@ class JobsRepository:
         )
         return result.rowcount == 1
 
+    async def extend_lease(
+        self, job_id: str, lease_token: str, lease_for: timedelta
+    ) -> bool:
+        """Продлевает только lease текущего владельца, не меняя этап."""
+        result = await self._session.execute(
+            update(TranscriptionJob)
+            .where(
+                TranscriptionJob.job_id == job_id,
+                TranscriptionJob.status == JobStatus.PROCESSING.value,
+                TranscriptionJob.lease_token == lease_token,
+                TranscriptionJob.locked_until > datetime.now(UTC),
+            )
+            .values(locked_until=datetime.now(UTC) + lease_for)
+        )
+        return result.rowcount == 1
+
     async def move_to_retry_wait(
         self,
         job_id: str,
+        lease_token: str,
         *,
         retry_at: datetime,
         error_code: str,
@@ -148,12 +169,15 @@ class JobsRepository:
             .where(
                 TranscriptionJob.job_id == job_id,
                 TranscriptionJob.status == JobStatus.PROCESSING.value,
+                TranscriptionJob.lease_token == lease_token,
+                TranscriptionJob.locked_until > datetime.now(UTC),
             )
             .values(
                 status=JobStatus.RETRY_WAIT.value,
                 current_stage=None,
                 next_retry_at=retry_at,
                 locked_until=None,
+                lease_token=None,
                 error_code=error_code,
                 error_message=error_message,
                 retryable=True,
@@ -164,21 +188,25 @@ class JobsRepository:
     async def complete_job_with_outbox(
         self,
         job_id: str,
+        lease_token: str,
         *,
         summary_bucket: str,
         summary_key: str,
+        detected_type: str,
         models: dict[str, object],
         event: NewOutboxEvent,
     ) -> None:
         """Переводит job в completed, создаёт outbox_event."""
         async with self._session.begin():
-            job = await self._get_processing_job(job_id)
+            job = await self._get_processing_job(job_id, lease_token)
             ensure_transition(JobStatus(job.status), JobStatus.COMPLETED)
             job.status = JobStatus.COMPLETED.value
             job.current_stage = None
             job.locked_until = None
+            job.lease_token = None
             job.summary_bucket = summary_bucket
             job.summary_key = summary_key
+            job.detected_type = detected_type
             job.models = models
             job.retryable = False
             job.completed_at = datetime.now(UTC)
@@ -187,6 +215,7 @@ class JobsRepository:
     async def fail_job_with_outbox(
         self,
         job_id: str,
+        lease_token: str,
         *,
         error_code: str,
         error_message: str,
@@ -194,11 +223,12 @@ class JobsRepository:
     ) -> None:
         """Переводит job в failed, создаёт outbox_event."""
         async with self._session.begin():
-            job = await self._get_processing_job(job_id)
+            job = await self._get_processing_job(job_id, lease_token)
             ensure_transition(JobStatus(job.status), JobStatus.FAILED)
             job.status = JobStatus.FAILED.value
             job.current_stage = None
             job.locked_until = None
+            job.lease_token = None
             job.error_code = error_code
             job.error_message = error_message
             job.retryable = False
@@ -256,17 +286,20 @@ class JobsRepository:
         )
         return result.rowcount == 1
 
-    async def _get_processing_job(self, job_id: str) -> TranscriptionJob:
+    async def _get_processing_job(self, job_id: str, lease_token: str) -> TranscriptionJob:
         statement = (
             select(TranscriptionJob)
-            .where(TranscriptionJob.job_id == job_id)
+            .where(
+                TranscriptionJob.job_id == job_id,
+                TranscriptionJob.status == JobStatus.PROCESSING.value,
+                TranscriptionJob.lease_token == lease_token,
+                TranscriptionJob.locked_until > datetime.now(UTC),
+            )
             .with_for_update()
         )
         job = await self._session.scalar(statement)
         if job is None:
-            raise LookupError(f"Job not found: {job_id}")
-        if job.status != JobStatus.PROCESSING.value:
-            raise ValueError(f"Job is not processing: {job_id}")
+            raise LookupError(f"Job lease is no longer owned: {job_id}")
         return job
 
     @staticmethod

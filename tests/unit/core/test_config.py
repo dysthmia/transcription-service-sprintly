@@ -65,3 +65,24 @@ def test_settings_redact_secrets(settings_environment: None) -> None:
     assert "deepseek-secret" not in rendered
     assert "secret-access-key" not in rendered
     assert "**********" in rendered
+
+
+def test_production_rejects_plaintext_kafka_and_http_api(
+    settings_environment: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT")
+    monkeypatch.setenv("DEEPSEEK_BASE_URL", "http://deepseek.example.test")
+
+    with pytest.raises(ValidationError, match="Kafka must use SSL or SASL_SSL"):
+        Settings(_env_file=None)
+
+
+def test_production_accepts_secure_transport(settings_environment: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("KAFKA_SECURITY_PROTOCOL", "SSL")
+    monkeypatch.setenv("S3_ALLOWED_SOURCE_BUCKETS", "materials")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.app_env == "production"
